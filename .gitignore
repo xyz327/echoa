@@ -1,0 +1,17 @@
+# Binaries
+bin/
+*.exe
+mcp-server
+
+# Local config override & secrets
+config/config.local.yaml
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.cer
+
+# OS
+.DS_Store

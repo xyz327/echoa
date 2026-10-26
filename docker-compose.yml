@@ -1,0 +1,60 @@
+services:
+  # 1. 示例 MySQL 数据源服务
+  mysql:
+    image: mysql:8.0
+    container_name: mcp-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_DATABASE: test
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-ppassword"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # 2. 示例 Redis 数据源服务
+  redis:
+    image: redis:7-alpine
+    container_name: mcp-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+
+  # 3. Echoa
+  echoa:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: echoa
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # 通过容器网络互联
+      - MYSQL_DSN=root:password@tcp(mysql:3306)/test?charset=utf8mb4&parseTime=True&loc=Local&multiStatements=false
+      - REDIS_ADDR=redis:6379
+      - MCP_RESOURCE_URL=http://localhost:8080
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/health/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
