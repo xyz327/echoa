@@ -441,9 +441,9 @@ func TestUnknownMethod404(t *testing.T) {
 	srv := NewServer("/mysql", registry, 5, nil)
 	ts := newTestServer(t, srv)
 
-	// 旧协议的 initialize 方法在 2026-07-28 中已移除，应返回 404 Method not found (-32601)
-	headers := standardHeaders("initialize", "")
-	body := standardBody(1, "initialize", nil)
+	// 未实现的方法应返回 404 Method not found (-32601)
+	headers := standardHeaders("unknown/method", "")
+	body := standardBody(1, "unknown/method", nil)
 
 	resp, respBytes := doPOST(t, ts.URL+"/mysql", headers, body)
 	if resp.StatusCode != http.StatusNotFound {
@@ -454,6 +454,171 @@ func TestUnknownMethod404(t *testing.T) {
 	_ = json.Unmarshal(respBytes, &rpcErr)
 	if rpcErr.Error == nil || rpcErr.Error.Code != ErrCodeMethodNotFound {
 		t.Errorf("expected code %d, got %v", ErrCodeMethodNotFound, rpcErr.Error)
+	}
+}
+
+func TestStandardClientLifecycle(t *testing.T) {
+	registry := NewToolRegistry()
+	registry.Register(&ToolDefinition{
+		Name:        "orders_query",
+		Description: "query orders",
+		InputSchema: map[string]any{"type": "object"},
+		Handler: func(ctx context.Context, claims *casdoorsdk.Claims, args map[string]any) (string, error) {
+			return `[{"id": 101, "total": 99.9}]`, nil
+		},
+	})
+	srv := NewServer("/mysql", registry, 5, nil)
+	ts := newTestServer(t, srv)
+
+	// 模拟 Cursor / Claude Desktop / Cline 客户端，无需 Mcp-Method / Mcp-Name / _meta 标头
+	plainHeaders := map[string]string{
+		"Content-Type": "application/json",
+	}
+
+	// 1. initialize 握手阶段
+	initBody := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params": map[string]any{
+			"protocolVersion": "2024-11-05",
+			"capabilities":    map[string]any{},
+			"clientInfo": map[string]any{
+				"name":    "cursor",
+				"version": "0.45.0",
+			},
+		},
+	}
+	resp, respBytes := doPOST(t, ts.URL+"/mysql", plainHeaders, initBody)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for initialize, got %d: %s", resp.StatusCode, string(respBytes))
+	}
+	var initResp struct {
+		JSONRPC string           `json:"jsonrpc"`
+		ID      any              `json:"id"`
+		Result  InitializeResult `json:"result"`
+	}
+	if err := json.Unmarshal(respBytes, &initResp); err != nil {
+		t.Fatalf("unmarshal initialize error: %v", err)
+	}
+	if initResp.Result.ProtocolVersion != "2024-11-05" {
+		t.Errorf("expected protocolVersion 2024-11-05, got %q", initResp.Result.ProtocolVersion)
+	}
+	if initResp.Result.ServerInfo.Name != "echoa" {
+		t.Errorf("expected server name echoa, got %q", initResp.Result.ServerInfo.Name)
+	}
+	if protoHeader := resp.Header.Get("MCP-Protocol-Version"); protoHeader != "2024-11-05" {
+		t.Errorf("expected MCP-Protocol-Version 2024-11-05 in header, got %q", protoHeader)
+	}
+
+	// 2. notifications/initialized 通知
+	notifBody := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "notifications/initialized",
+	}
+	respNotif, respNotifBytes := doPOST(t, ts.URL+"/mysql", plainHeaders, notifBody)
+	if respNotif.StatusCode != http.StatusAccepted {
+		t.Errorf("expected 202 Accepted for notification, got %d", respNotif.StatusCode)
+	}
+	if len(respNotifBytes) > 0 {
+		t.Errorf("expected empty body for 202, got %s", string(respNotifBytes))
+	}
+
+	// 3. ping 保活
+	pingBody := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "ping",
+	}
+	respPing, respPingBytes := doPOST(t, ts.URL+"/mysql", plainHeaders, pingBody)
+	if respPing.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for ping, got %d", respPing.StatusCode)
+	}
+	var pingResp JSONRPCResponse
+	if err := json.Unmarshal(respPingBytes, &pingResp); err != nil {
+		t.Fatalf("unmarshal ping error: %v", err)
+	}
+	if pingResp.Error != nil {
+		t.Errorf("ping returned error: %v", pingResp.Error)
+	}
+
+	// 4. tools/list 获取工具列表 (无 Mcp-Method 头，无 _meta 字段)
+	listBody := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      3,
+		"method":  "tools/list",
+	}
+	respList, respListBytes := doPOST(t, ts.URL+"/mysql", plainHeaders, listBody)
+	if respList.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for tools/list, got %d: %s", respList.StatusCode, string(respListBytes))
+	}
+	var listResp struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      any             `json:"id"`
+		Result  ListToolsResult `json:"result"`
+	}
+	if err := json.Unmarshal(respListBytes, &listResp); err != nil {
+		t.Fatalf("unmarshal tools/list error: %v", err)
+	}
+	if len(listResp.Result.Tools) != 1 || listResp.Result.Tools[0].Name != "orders_query" {
+		t.Errorf("unexpected tools: %+v", listResp.Result.Tools)
+	}
+
+	// 5. tools/call 执行工具调用 (无 Mcp-Method / Mcp-Name 头，无 _meta 字段)
+	callBody := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      4,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "orders_query",
+			"arguments": map[string]any{
+				"sql": "SELECT * FROM orders",
+			},
+		},
+	}
+	respCall, respCallBytes := doPOST(t, ts.URL+"/mysql", plainHeaders, callBody)
+	if respCall.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for tools/call, got %d: %s", respCall.StatusCode, string(respCallBytes))
+	}
+	var callResp struct {
+		JSONRPC string         `json:"jsonrpc"`
+		ID      any            `json:"id"`
+		Result  CallToolResult `json:"result"`
+	}
+	if err := json.Unmarshal(respCallBytes, &callResp); err != nil {
+		t.Fatalf("unmarshal tools/call error: %v", err)
+	}
+	if callResp.Result.IsError || len(callResp.Result.Content) == 0 {
+		t.Fatalf("unexpected call result: %+v", callResp.Result)
+	}
+	if callResp.Result.Content[0].Text != `[{"id": 101, "total": 99.9}]` {
+		t.Errorf("unexpected content text: %s", callResp.Result.Content[0].Text)
+	}
+}
+
+func TestStandardClientUnsupportedVersion(t *testing.T) {
+	registry := NewToolRegistry()
+	srv := NewServer("/mysql", registry, 5, nil)
+	ts := newTestServer(t, srv)
+
+	headers := map[string]string{
+		"Content-Type":         "application/json",
+		"MCP-Protocol-Version": "2020-01-01", // 完全未知的非法版本
+	}
+	body := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/list",
+	}
+
+	resp, respBytes := doPOST(t, ts.URL+"/mysql", headers, body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for unsupported version, got %d", resp.StatusCode)
+	}
+	var errResp JSONRPCResponse
+	_ = json.Unmarshal(respBytes, &errResp)
+	if errResp.Error == nil || errResp.Error.Code != ErrCodeUnsupportedProtocolVersion {
+		t.Errorf("expected error code %d, got %v", ErrCodeUnsupportedProtocolVersion, errResp.Error)
 	}
 }
 

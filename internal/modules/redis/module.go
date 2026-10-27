@@ -66,6 +66,7 @@ func registerModule(registry *mcp.ToolRegistry, name string, cfg config.RedisCon
 
 	baseOpts := &redis.Options{
 		Addr:            cfg.Addr,
+		Username:        cfg.Username,
 		Password:        cfg.Password,
 		PoolSize:        cfg.PoolSize,
 		MinIdleConns:    cfg.MinIdleConns,

@@ -3,7 +3,11 @@ package mcp
 import "encoding/json"
 
 const (
-	// ProtocolVersion20260728 是 MCP 2026-07-28 无状态 Streamable HTTP 协议版本
+	// 支持的 MCP 协议版本 (包含主流旧代版本与 2026-07-28 现代版本)
+	ProtocolVersion20241105 = "2024-11-05"
+	ProtocolVersion20250326 = "2025-03-26"
+	ProtocolVersion20250618 = "2025-06-18"
+	ProtocolVersion20251125 = "2025-11-25"
 	ProtocolVersion20260728 = "2026-07-28"
 
 	// JSON-RPC 2.0 及 MCP 规范保留错误码
@@ -21,6 +25,43 @@ const (
 	// 服务端应用级自定义错误码
 	ErrCodeTooManyRequests = -32000
 )
+
+// SupportedProtocolVersions 服务端支持的协议版本全集
+var SupportedProtocolVersions = []string{
+	ProtocolVersion20241105,
+	ProtocolVersion20250326,
+	ProtocolVersion20250618,
+	ProtocolVersion20251125,
+	ProtocolVersion20260728,
+}
+
+// ClientInfo 客户端应用元数据 (initialize 入参)
+type ClientInfo struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
+// ClientCapabilities 客户端声明的能力集 (initialize 入参)
+type ClientCapabilities struct {
+	Roots        map[string]any `json:"roots,omitempty"`
+	Sampling     map[string]any `json:"sampling,omitempty"`
+	Experimental map[string]any `json:"experimental,omitempty"`
+}
+
+// InitializeParams initialize 方法入参
+type InitializeParams struct {
+	ProtocolVersion string             `json:"protocolVersion"`
+	Capabilities    ClientCapabilities `json:"capabilities"`
+	ClientInfo      ClientInfo         `json:"clientInfo"`
+}
+
+// InitializeResult initialize 方法响应结果
+type InitializeResult struct {
+	ProtocolVersion string             `json:"protocolVersion"`
+	Capabilities    ServerCapabilities `json:"capabilities"`
+	ServerInfo      ServerInfo         `json:"serverInfo"`
+	Instructions    string             `json:"instructions,omitempty"`
+}
 
 // JSONRPCRequest 基础请求报文
 type JSONRPCRequest struct {
@@ -69,10 +110,10 @@ type DiscoverResult struct {
 
 // ListToolsResult tools/list 方法的响应结果
 type ListToolsResult struct {
-	ResultType string            `json:"resultType"` // "complete"
+	ResultType string            `json:"resultType,omitempty"` // "complete"
 	Tools      []*ToolDefinition `json:"tools"`
-	TTLMs      int64             `json:"ttlMs"`
-	CacheScope string            `json:"cacheScope"` // "public"
+	TTLMs      int64             `json:"ttlMs,omitempty"`
+	CacheScope string            `json:"cacheScope,omitempty"` // "public"
 }
 
 // ToolContent MCP Tool 文本内容
@@ -83,7 +124,7 @@ type ToolContent struct {
 
 // CallToolResult tools/call 响应结果
 type CallToolResult struct {
-	ResultType string        `json:"resultType"` // "complete"
+	ResultType string        `json:"resultType,omitempty"` // "complete"
 	Content    []ToolContent `json:"content"`
 	IsError    bool          `json:"isError,omitempty"`
 }

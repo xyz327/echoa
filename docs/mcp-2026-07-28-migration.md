@@ -8,7 +8,7 @@ Echoa 最初实现的是 2024-11-05 的 HTTP+SSE（`GET <endpoint>/sse` 开长�
 
 工具层保持不变：MySQL 和 Redis 的工具均属于单次请求、只读且无状态的操作。连接池按数据源复用，执行主体来源于每次请求的 Casdoor JWT。Redis 的 `SCAN` 游标在单次调用内消化，不跨请求维持上下文。重构范围聚焦于传输通道、协议封装与并发治理。
 
-Echoa 仅实现 2026-07-28 规范，不做双代（Dual-era）兼容。仍依赖旧版 `initialize` 握手与长连接的客户端（如基于 MCP 2025-11-25 或更早版本）会因缺少 `MCP-Protocol-Version` 等标头或请求未实现方法而被拦截拒绝。这是有意的设计取舍：规范将双代兼容列为可选（MAY），而彻底移除会话管理使得服务完全无状态化，极大降低了运维复杂度与内存开销。
+Echoa 采用双代兼容（Dual-Era）架构：对 Cursor、Claude Desktop、Cline 等主流客户端，支持标准的 `initialize` 握手（自动协商版本 `2024-11-05` ~ `2025-11-25`）、`notifications/initialized`、`ping` 以及标准 JSON-RPC 的工具调用，无需自定义标头；同时完整支持 2026-07-28 无状态 Streamable HTTP 规范与 `server/discover`。在传输层彻底移除了长连接与会话状态管理，服务完全无状态化，极大降低了运维复杂度与内存开销。
 
 ## 架构对比
 
@@ -38,7 +38,7 @@ Echoa 仅实现 2026-07-28 规范，不做双代（Dual-era）兼容。仍依赖
    - 调用 `tools/call` 时，必须携带 `Mcp-Name` 请求头（支持 RFC 2047 MIME Base64 编码）且与 `params.name` 一致；否则返回 400（`-32020`）。
 4. **通知处理**：对于未携带 `id` 的通知类请求（如 `notifications/initialized`），服务端直接返回 HTTP 202 Accepted，不执行业务逻辑。
 5. **方法分发**：
-   - 未知方法（包括旧版 `initialize`、`ping` 等）直接返回 HTTP 404 及错误码 `-32601 Method not found`。
+   - 未知方法直接返回 HTTP 404 及错误码 `-32601 Method not found`。
    - 合法方法在当前 endpoint 的独立工具注册表中执行，成功返回 HTTP 200。
 6. **非 POST 方法拦截**：`GET`、`DELETE` 等请求统一返回 HTTP 405 Method Not Allowed 并带有 `Allow: POST`。
 
@@ -46,8 +46,10 @@ Echoa 仅实现 2026-07-28 规范，不做双代（Dual-era）兼容。仍依赖
 
 | 方法 | 行为说明 |
 | :--- | :--- |
-| `server/discover` | 返回 `supportedVersions: ["2026-07-28"]`、`capabilities: { tools: {} }`、`ttlMs: 3600000`、`cacheScope: "public"`。服务身份放置于结果的 `_meta["io.modelcontextprotocol/serverInfo"]`。 |
-| `tools/list` | 列出当前 endpoint 独享的工具清单，结果附带 `resultType: "complete"`。工具按名称升序稳定排序。 |
+| `initialize` | 主流客户端协议握手与版本协商，返回 `capabilities.tools`、`serverInfo` 及协商后的 `protocolVersion`（如 `2024-11-05`）。 |
+| `ping` | 连接活性探活，返回 `{}` 空结果。 |
+| `server/discover` | 现代 2026-07-28 客户端免握手发现，返回 `supportedVersions: ["2026-07-28"]`、`capabilities: { tools: {} }`、`ttlMs: 3600000`、`cacheScope: "public"`。服务身份放置于结果的 `_meta["io.modelcontextprotocol/serverInfo"]`。 |
+| `tools/list` | 列出当前 endpoint 独享的工具清单。工具按名称升序稳定排序。 |
 | `tools/call` | 执行具体的工具调用，附带并发控制与审计记录。工具内部错误以 `isError: true` 正常返回 HTTP 200，不作为协议级错误。 |
 
 ## 架构精简与已移除组件

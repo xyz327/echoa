@@ -34,9 +34,12 @@
 
 ## 核心架构特性
 
-1. **原生无状态 Streamable HTTP 传输**：基于 Go 标准库 `net/http` 原生 `http.NewServeMux` 与标准 JSON-RPC 2.0，零第三方 Web 框架开销。严格遵循 MCP 2026-07-28 规范，每个请求独立自包含，无会话状态依赖，兼容各类反向代理与水平扩展。
-2. **标准 Casdoor OAuth 2.1 鉴权**：
-   - 严格遵循 RFC 6750，通过 `Authorization: Bearer <jwt>` 标头进行无状态公钥验签。
+1. **双代兼容（Dual-Era）与原生无状态 Streamable HTTP 传输**：基于 Go 标准库 `net/http` 原生 `http.NewServeMux` 与标准 JSON-RPC 2.0，零第三方 Web 框架开销。既支持主流客户端（Cursor、Claude Desktop、Cline）标准的 `initialize` 握手、`notifications/initialized`、`ping` 生命周期与常规工具调用，也完整支持 MCP 2026-07-28 无状态 Streamable HTTP 规范与 `server/discover` 端点。无会话状态依赖，兼容各类反向代理与水平扩展。
+2. **标准 Casdoor OAuth 2.1 鉴权与 JWKS 自动轮转**：
+   - 支持动态获取 Casdoor OIDC JWKS（`/.well-known/jwks`）公钥集合并实现内存缓存与自动公钥轮转，网络故障时平滑回退至静态 Certificate PEM。
+   - 强制校验 JWT `Audience`（`aud`），杜绝 Casdoor 同一实例下不同 Client ID 跨应用伪造与越权风险。
+   - 严密拦截 OAuth Refresh Token 冒充 Access Token。
+   - 严格遵循 RFC 6750，通过 `Authorization: Bearer <jwt>` 标头进行无状态验签。
    - 兼容老旧客户端通过 URL Query（`?token=...` / `?access_token=...`）传参的模式（已标记为 Deprecated 并记录安全告警）。
    - 实现 RFC 9728 规范的 Protected Resource Metadata (`/.well-known/oauth-protected-resource`)，支持客户端自动发现认证服务器与 Scope。
 3. **MySQL 深度 AST 防御体系**：
@@ -45,8 +48,9 @@
    - 智能 LIMIT 注入与改写：无 LIMIT 自动追加系统上限；超过配置上限强制压低改写；保留原分页 offset；子查询与外层查询严格隔离改写。
    - 敏感数据表黑名单过滤（支持 `table` 与 `schema.table` 精准匹配拦截）。
    - 双重防撑爆防护：单单元格 4KB 缩略截断 + 结果集 64KB 字符级硬上限。
-4. **Redis 多 DB 独立隔离与连接池治理**：
-   - 动态客户端管理器（`MultiDBManager`），每个逻辑 DB 独立连接池懒加载，**杜绝并发执行 `SELECT` 导致的数据串库重大隐患**。
+4. **Redis 6 ACL 鉴权与多 DB 独立隔离治理**：
+   - 支持 Redis 6+ ACL 用户名（`username`）与密码认证，原生适配腾讯云等只读 ACL 账号（如 `mcp_ro`）。
+   - 动态客户端管理器（`MultiDBManager`），每个逻辑 DB 独立连接池懒加载并继承 ACL 凭证，**杜绝并发执行 `SELECT` 导致的数据串库重大隐患**。
    - 完备连接池生命周期参数（`pool_size`、`min_idle_conns`、10m 空闲超时、1h 存活淘汰），防御云原生网络下的静默断连。
    - 统一命令网关 `redis_execute`，内置命令白名单与硬黑名单防御（阻断 `KEYS`、`FLUSHALL`、`CONFIG`、写操作及手动切库 `SELECT`）。
    - 多类型（`[]string`、`map[string]string`、RESP3 `map[any]any`）双重截断保护（条目上限 + 64KB 响应硬上限）。
@@ -175,7 +179,7 @@
 
 | 路径 | 方法 | 鉴权要求 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `<endpoint>` | `POST` | 依配置（Bearer JWT） | MCP 2026-07-28 无状态 Streamable HTTP JSON-RPC 消息入口。`<endpoint>` 来自配置的 `endpoints[].path`（如 `/mysql`、`/redis`）。GET/DELETE 会明确返回 405 |
+| `<endpoint>` | `POST` | 依配置（Bearer JWT） | MCP 双代兼容 Streamable HTTP JSON-RPC 消息入口（兼容主流客户端 `initialize`/`ping` 与 2026-07-28 规范）。`<endpoint>` 来自配置的 `endpoints[].path`（如 `/mysql`、`/redis`）。GET/DELETE 会明确返回 405 |
 | `/.well-known/oauth-protected-resource` | `GET` | 公开免鉴权 | **RFC 9728 PRM 元数据**，供 AI 客户端自动发现 OAuth 认证端点与 Scope |
 | `/health` | `GET` | 公开免鉴权 | K8s 存活探针 (Liveness)，返回 HTTP 200 `{"status":"ok"}` |
 | `/health/ready` | `GET` | 公开免鉴权 | K8s 就绪探针 (Readiness)，实际探测 MySQL 与 Redis 联通性，不健康时返回 HTTP 503 |
@@ -231,7 +235,9 @@ auth:
   endpoint: "https://casdoor.example.com"                   # Casdoor 实例根地址
   client_id: "mcp-service"                                  # Casdoor 客户端 ID
   client_secret: "${CASDOOR_CLIENT_SECRET}"                 # 客户端密钥
-  certificate: "${CASDOOR_JWT_CERT}"                       # Casdoor 应用的 x509 JWT 公钥证书内容
+  certificate: "${CASDOOR_JWT_CERT}"                       # Casdoor 应用的 x509 JWT 公钥证书内容 (兜底)
+  audience: "${CASDOOR_AUDIENCE:-}"                        # 预期 JWT Audience (aud)，默认取 client_id
+  jwks_uri: "${CASDOOR_JWKS_URI:-}"                        # Casdoor JWKS 端点 (留空推导为 <endpoint>/.well-known/jwks)
   organization_name: "your-org"                             # 组织名称
   application_name: "mcp-app"                               # 应用名称
   scopes_required:                                          # 要求的权限范围
@@ -256,9 +262,10 @@ sources:
   redis:
     redis-main:
       addr: "${REDIS_ADDR:-127.0.0.1:6379}"
+      username: "${REDIS_USERNAME:-}"                       # Redis 6 ACL 用户名 (如腾讯云只读账号 mcp_ro)
       password: "${REDIS_PASSWORD:-}"
       allowed_dbs: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] # 允许访问的 DB 列表
-    pool_size: 20               # 每个 DB 连接池大小
+      pool_size: 20               # 每个 DB 连接池大小
     min_idle_conns: 5           # 最小空闲连接
     max_items_limit: 200        # 集合/列表类返回元素的最大上限
     query_timeout_ms: 3000      # 单次执行超时时间 (毫秒)
@@ -353,9 +360,12 @@ endpoints:
 | :--- | :--- | :--- |
 | `MCP_RESOURCE_URL` | `auth.resource_url` | `http://127.0.0.1:8080` |
 | `CASDOOR_CLIENT_SECRET` | `auth.client_secret` | - |
-| `CASDOOR_JWT_CERT` | `auth.certificate` | Casdoor x509 证书内容 |
+| `CASDOOR_JWT_CERT` | `auth.certificate` | Casdoor x509 证书内容 (静态兜底) |
+| `CASDOOR_AUDIENCE` | `auth.audience` | 预期 JWT Audience (如 `f983ca0f75f64773a09c`) |
+| `CASDOOR_JWKS_URI` | `auth.jwks_uri` | `https://casdoor.example.com/.well-known/jwks` |
 | `MYSQL_DSN` | `sources.mysql.mysql-main.dsn` | `root:password@tcp(127.0.0.1:3306)/test?...` |
 | `REDIS_ADDR` | `sources.redis.redis-main.addr` | `127.0.0.1:6379` |
+| `REDIS_USERNAME` | `sources.redis.redis-main.username` | Redis 6 ACL 用户名 (如 `mcp_ro`) |
 | `REDIS_PASSWORD` | `sources.redis.redis-main.password` | 空 |
 
 这三项只是默认配置用的占位符。自己加的 source 用什么环境变量，由那段配置里写的 `${...}` 决定，例如 `${MYSQL_ORDERS_DSN}`。
@@ -430,10 +440,13 @@ docker run --rm -d -p 8080:8080 \
 ## 客户端接入配置
 
 > **协议版本与客户端兼容性提示**：
-> Echoa 严格遵循 **MCP 2026-07-28 无状态 Streamable HTTP 规范**：
-> - **无握手阶段**：不实现旧版规范的 `initialize` 与 `notifications/initialized`，服务身份与工具能力由 `server/discover` 端点暴露。
-> - **每请求标头校验**：所有 RPC 请求必须携带 `MCP-Protocol-Version: 2026-07-28` 及 `Mcp-Method`（`tools/call` 还需携带 `Mcp-Name`），且请求体 `params._meta["io.modelcontextprotocol/protocolVersion"]` 需与标头一致。
-> - **客户端支持**：接入的客户端需支持 2026-07-28 无状态 HTTP 协议。若客户端仍在发送旧版 `initialize` 握手请求（MCP 2025-11-25 及更早），服务端会因标头缺失返回 400 或因方法未实现返回 404。
+> Echoa 采用**双代客户端兼容（Dual-Era）架构**，同时支持主流标准客户端与现代无状态客户端：
+> - **主流标准客户端兼容（Cursor, Claude Desktop, Cline 等）**：
+>   - 原生支持标准 JSON-RPC 2.0 生命周期的 `initialize` 握手（自动协商受支持版本 `2024-11-05` ~ `2025-11-25`）、`notifications/initialized` 与 `ping` 保活。
+>   - 标准工具列表（`tools/list`）与调用（`tools/call`）无需携带 `Mcp-Method` / `Mcp-Name` 自定义请求头及 `_meta` 字段，主流客户端配置 URL 即可即插即用。
+> - **现代无状态客户端（MCP 2026-07-28 规范）**：
+>   - 显式声明 `MCP-Protocol-Version: 2026-07-28` 或 `Mcp-Method` 的现代客户端，启用每请求严格标头一致性与 `_meta` 校验。
+>   - 支持通过 `server/discover` 端点免握手自省服务能力、指令与缓存新鲜度（TTL）。
 
 推荐使用 **OAuth 自动认证**：配置中只写服务 URL，不要预置 `Authorization`。客户端访问时收到 HTTP 401，从 `WWW-Authenticate` 中的 `resource_metadata` 发现 Casdoor，再打开浏览器完成登录。手工 Bearer Token 仅用于调试、自动化脚本，或不支持 OAuth 发现的客户端。
 

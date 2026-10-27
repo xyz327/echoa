@@ -106,7 +106,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 5. 协议元数据校验 (MCP 2026-07-28 规范要求)
+	// 5. 协议元数据校验 (双代客户端兼顾：MCP 2026-07-28 规范与主流标准客户端)
 	var paramMeta struct {
 		Meta map[string]any `json:"_meta"`
 	}
@@ -114,80 +114,126 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	bodyVersion, _ := paramMeta.Meta["io.modelcontextprotocol/protocolVersion"].(string)
 	headerVersion := r.Header.Get("MCP-Protocol-Version")
-
-	// 校验 MCP-Protocol-Version 头与 body _meta 字段是否存在且一致
-	if headerVersion == "" || bodyVersion == "" || headerVersion != bodyVersion {
-		writeJSON(w, http.StatusBadRequest, JSONRPCResponse{
-			JSONRPC: "2.0",
-			ID:      req.ID,
-			Error: &JSONRPCError{
-				Code:    ErrCodeHeaderMismatch,
-				Message: "Header mismatch: MCP-Protocol-Version header missing or does not match body _meta",
-			},
-		})
-		return
-	}
-
-	// 校验协议版本是否支持
-	if headerVersion != ProtocolVersion20260728 {
-		writeJSON(w, http.StatusBadRequest, JSONRPCResponse{
-			JSONRPC: "2.0",
-			ID:      req.ID,
-			Error: &JSONRPCError{
-				Code:    ErrCodeUnsupportedProtocolVersion,
-				Message: "Unsupported protocol version",
-				Data: map[string]any{
-					"supported": []string{ProtocolVersion20260728},
-					"requested": headerVersion,
-				},
-			},
-		})
-		return
-	}
-
-	// 校验 Mcp-Method 头与 JSON-RPC method 是否一致
 	headerMethod := r.Header.Get("Mcp-Method")
-	if headerMethod == "" || headerMethod != req.Method {
-		writeJSON(w, http.StatusBadRequest, JSONRPCResponse{
-			JSONRPC: "2.0",
-			ID:      req.ID,
-			Error: &JSONRPCError{
-				Code:    ErrCodeHeaderMismatch,
-				Message: "Header mismatch: Mcp-Method header missing or does not match JSON-RPC method",
-			},
-		})
-		return
-	}
+	headerName := r.Header.Get("Mcp-Name")
 
-	// tools/call 要求携带 Mcp-Name 请求头且与 params.name 一致
-	if req.Method == "tools/call" {
-		var callTool struct {
-			Name string `json:"name"`
-		}
-		if err := json.Unmarshal(req.Params, &callTool); err != nil || callTool.Name == "" {
-			writeJSON(w, http.StatusBadRequest, JSONRPCResponse{
-				JSONRPC: "2.0",
-				ID:      req.ID,
-				Error: &JSONRPCError{
-					Code:    ErrCodeInvalidParams,
-					Message: "Invalid params: name is required",
-				},
-			})
-			return
-		}
+	// 判断是否为显式声明 2026-07-28 的请求（携带了 2026-07-28 专属标头或 body 版本）
+	isModern20260728 := headerVersion == ProtocolVersion20260728 ||
+		bodyVersion == ProtocolVersion20260728 ||
+		headerMethod != "" ||
+		headerName != ""
 
-		headerName := r.Header.Get("Mcp-Name")
-		decodedHeaderName := decodeSentinelHeader(headerName)
-		if headerName == "" || decodedHeaderName != callTool.Name {
+	if isModern20260728 {
+		// 校验 MCP-Protocol-Version 头与 body _meta 字段是否存在且一致
+		if headerVersion == "" || bodyVersion == "" || headerVersion != bodyVersion {
 			writeJSON(w, http.StatusBadRequest, JSONRPCResponse{
 				JSONRPC: "2.0",
 				ID:      req.ID,
 				Error: &JSONRPCError{
 					Code:    ErrCodeHeaderMismatch,
-					Message: "Header mismatch: Mcp-Name header missing or does not match params.name",
+					Message: "Header mismatch: MCP-Protocol-Version header missing or does not match body _meta",
 				},
 			})
 			return
+		}
+
+		// 校验协议版本是否支持
+		if headerVersion != ProtocolVersion20260728 {
+			writeJSON(w, http.StatusBadRequest, JSONRPCResponse{
+				JSONRPC: "2.0",
+				ID:      req.ID,
+				Error: &JSONRPCError{
+					Code:    ErrCodeUnsupportedProtocolVersion,
+					Message: "Unsupported protocol version",
+					Data: map[string]any{
+						"supported": []string{ProtocolVersion20260728},
+						"requested": headerVersion,
+					},
+				},
+			})
+			return
+		}
+
+		// 校验 Mcp-Method 头与 JSON-RPC method 是否一致
+		if headerMethod == "" || headerMethod != req.Method {
+			writeJSON(w, http.StatusBadRequest, JSONRPCResponse{
+				JSONRPC: "2.0",
+				ID:      req.ID,
+				Error: &JSONRPCError{
+					Code:    ErrCodeHeaderMismatch,
+					Message: "Header mismatch: Mcp-Method header missing or does not match JSON-RPC method",
+				},
+			})
+			return
+		}
+
+		// tools/call 要求携带 Mcp-Name 请求头且与 params.name 一致
+		if req.Method == "tools/call" {
+			var callTool struct {
+				Name string `json:"name"`
+			}
+			if err := json.Unmarshal(req.Params, &callTool); err != nil || callTool.Name == "" {
+				writeJSON(w, http.StatusBadRequest, JSONRPCResponse{
+					JSONRPC: "2.0",
+					ID:      req.ID,
+					Error: &JSONRPCError{
+						Code:    ErrCodeInvalidParams,
+						Message: "Invalid params: name is required",
+					},
+				})
+				return
+			}
+
+			decodedHeaderName := decodeSentinelHeader(headerName)
+			if headerName == "" || decodedHeaderName != callTool.Name {
+				writeJSON(w, http.StatusBadRequest, JSONRPCResponse{
+					JSONRPC: "2.0",
+					ID:      req.ID,
+					Error: &JSONRPCError{
+						Code:    ErrCodeHeaderMismatch,
+						Message: "Header mismatch: Mcp-Name header missing or does not match params.name",
+					},
+				})
+				return
+			}
+		}
+		w.Header().Set("MCP-Protocol-Version", ProtocolVersion20260728)
+	} else {
+		// 主流标准客户端（Cursor, Claude Desktop, Cline 等）兼容层
+		if headerVersion != "" {
+			if !isSupportedProtocolVersion(headerVersion) {
+				writeJSON(w, http.StatusBadRequest, JSONRPCResponse{
+					JSONRPC: "2.0",
+					ID:      req.ID,
+					Error: &JSONRPCError{
+						Code:    ErrCodeUnsupportedProtocolVersion,
+						Message: "Unsupported protocol version",
+						Data: map[string]any{
+							"supported": SupportedProtocolVersions,
+							"requested": headerVersion,
+						},
+					},
+				})
+				return
+			}
+			w.Header().Set("MCP-Protocol-Version", headerVersion)
+		}
+
+		if req.Method == "tools/call" {
+			var callTool struct {
+				Name string `json:"name"`
+			}
+			if err := json.Unmarshal(req.Params, &callTool); err != nil || callTool.Name == "" {
+				writeJSON(w, http.StatusBadRequest, JSONRPCResponse{
+					JSONRPC: "2.0",
+					ID:      req.ID,
+					Error: &JSONRPCError{
+						Code:    ErrCodeInvalidParams,
+						Message: "Invalid params: name is required",
+					},
+				})
+				return
+			}
 		}
 	}
 
@@ -197,6 +243,42 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) dispatch(w http.ResponseWriter, r *http.Request, req JSONRPCRequest) {
 	switch req.Method {
+	case "initialize":
+		var initParams InitializeParams
+		_ = json.Unmarshal(req.Params, &initParams)
+
+		negotiatedVersion := ProtocolVersion20241105
+		if initParams.ProtocolVersion != "" && isSupportedProtocolVersion(initParams.ProtocolVersion) {
+			negotiatedVersion = initParams.ProtocolVersion
+		} else if hv := r.Header.Get("MCP-Protocol-Version"); hv != "" && isSupportedProtocolVersion(hv) {
+			negotiatedVersion = hv
+		}
+
+		w.Header().Set("MCP-Protocol-Version", negotiatedVersion)
+		result := InitializeResult{
+			ProtocolVersion: negotiatedVersion,
+			Capabilities: ServerCapabilities{
+				Tools: map[string]any{},
+			},
+			ServerInfo: ServerInfo{
+				Name:    "echoa",
+				Version: "1.0.0",
+			},
+			Instructions: "Read-only tools for the sources mounted on this endpoint. Every call is independent and requires its own arguments.",
+		}
+		writeJSON(w, http.StatusOK, JSONRPCResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Result:  result,
+		})
+
+	case "ping":
+		writeJSON(w, http.StatusOK, JSONRPCResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Result:  map[string]any{},
+		})
+
 	case "server/discover":
 		result := DiscoverResult{
 			ResultType:        "complete",
@@ -397,6 +479,16 @@ func sanitizeAuditArgs(args map[string]any) map[string]any {
 		}
 	}
 	return clean
+}
+
+// isSupportedProtocolVersion 判断是否为受支持的 MCP 协议版本
+func isSupportedProtocolVersion(v string) bool {
+	for _, supported := range SupportedProtocolVersions {
+		if supported == v {
+			return true
+		}
+	}
+	return false
 }
 
 // ClaimsFrom 读取鉴权中间件放入请求 context 的 Casdoor 声明。

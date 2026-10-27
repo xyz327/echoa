@@ -35,6 +35,8 @@ type AuthConfig struct {
 	ClientID         string   `mapstructure:"client_id"`
 	ClientSecret     string   `mapstructure:"client_secret"`
 	Certificate      string   `mapstructure:"certificate"`
+	Audience         string   `mapstructure:"audience"` // 预期 JWT Audience (aud)，留空默认使用 client_id
+	JWKSURI          string   `mapstructure:"jwks_uri"` // 可选 JWKS 端点地址，留空默认推导为 <endpoint>/.well-known/jwks
 	OrganizationName string   `mapstructure:"organization_name"`
 	ApplicationName  string   `mapstructure:"application_name"`
 	ScopesRequired   []string `mapstructure:"scopes_required"`
@@ -81,6 +83,7 @@ type RedisSecurityConfig struct {
 
 type RedisConfig struct {
 	Addr           string              `mapstructure:"addr"`
+	Username       string              `mapstructure:"username"`
 	Password       string              `mapstructure:"password"`
 	AllowedDBs     []int               `mapstructure:"allowed_dbs"`
 	PoolSize       int                 `mapstructure:"pool_size"`
@@ -220,6 +223,8 @@ func expandEnvs(cfg *Config) {
 	cfg.Auth.Endpoint = expandEnvWithDefault(cfg.Auth.Endpoint)
 	cfg.Auth.ClientSecret = expandEnvWithDefault(cfg.Auth.ClientSecret)
 	cfg.Auth.Certificate = expandEnvWithDefault(cfg.Auth.Certificate)
+	cfg.Auth.Audience = expandEnvWithDefault(cfg.Auth.Audience)
+	cfg.Auth.JWKSURI = expandEnvWithDefault(cfg.Auth.JWKSURI)
 
 	for name, src := range cfg.Sources.MySQL {
 		src.DSN = expandEnvWithDefault(src.DSN)
@@ -240,6 +245,7 @@ func expandEnvs(cfg *Config) {
 
 	for name, src := range cfg.Sources.Redis {
 		src.Addr = expandEnvWithDefault(src.Addr)
+		src.Username = expandEnvWithDefault(src.Username)
 		src.Password = expandEnvWithDefault(src.Password)
 		if src.MaxItemsLimit <= 0 {
 			src.MaxItemsLimit = 200

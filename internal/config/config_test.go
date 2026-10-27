@@ -184,3 +184,47 @@ sources:
 		})
 	}
 }
+
+func TestLoadRedisACLAndCasdoorConfig(t *testing.T) {
+	t.Setenv("REDIS_USER", "mcp_ro")
+	t.Setenv("CASDOOR_AUD", "f983ca0f75f64773a09c")
+	t.Setenv("CASDOOR_JWKS", "https://casdoor.example.com/.well-known/jwks")
+
+	raw := `
+server:
+  port: 8080
+auth:
+  enabled: true
+  client_id: "mcp-service"
+  audience: "${CASDOOR_AUD:-default-aud}"
+  jwks_uri: "${CASDOOR_JWKS:-}"
+sources:
+  mysql:
+    db1:
+      dsn: "root:pass@tcp(127.0.0.1:3306)/test"
+  redis:
+    cache:
+      addr: "127.0.0.1:6379"
+      username: "${REDIS_USER:-default-user}"
+      password: "pwd"
+endpoints:
+  - path: /db1
+    sources: [db1]
+  - path: /redis
+    sources: [cache]
+`
+	cfg, err := Load(writeConfig(t, raw))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if got := cfg.Sources.Redis["cache"].Username; got != "mcp_ro" {
+		t.Errorf("redis username = %q, want 'mcp_ro'", got)
+	}
+	if got := cfg.Auth.Audience; got != "f983ca0f75f64773a09c" {
+		t.Errorf("auth audience = %q, want 'f983ca0f75f64773a09c'", got)
+	}
+	if got := cfg.Auth.JWKSURI; got != "https://casdoor.example.com/.well-known/jwks" {
+		t.Errorf("auth jwks_uri = %q, want 'https://casdoor.example.com/.well-known/jwks'", got)
+	}
+}

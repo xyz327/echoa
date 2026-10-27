@@ -188,3 +188,32 @@ func TestMultiDBManagerPoolOptions(t *testing.T) {
 		t.Errorf("expected ConnMaxLifetime 1h, got %v", opts.ConnMaxLifetime)
 	}
 }
+
+func TestRedisACLUsernamePropagated(t *testing.T) {
+	baseOpts := &redis.Options{
+		Addr:     "127.0.0.1:6379",
+		Username: "mcp_ro",
+		Password: "secret_password",
+	}
+	mgr := NewMultiDBManager(baseOpts, []int{0, 2})
+	defer mgr.Close()
+
+	client0, err := mgr.GetClient(0)
+	if err != nil {
+		t.Fatalf("failed to get client for db 0: %v", err)
+	}
+	if client0.Options().Username != "mcp_ro" {
+		t.Errorf("expected username 'mcp_ro', got '%s'", client0.Options().Username)
+	}
+	if client0.Options().Password != "secret_password" {
+		t.Errorf("expected password 'secret_password', got '%s'", client0.Options().Password)
+	}
+
+	client2, err := mgr.GetClient(2)
+	if err != nil {
+		t.Fatalf("failed to get client for db 2: %v", err)
+	}
+	if client2.Options().Username != "mcp_ro" {
+		t.Errorf("expected username 'mcp_ro' for db 2, got '%s'", client2.Options().Username)
+	}
+}

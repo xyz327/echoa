@@ -12,6 +12,8 @@ auth:
   client_id: "mcp-service"
   client_secret: "${CASDOOR_CLIENT_SECRET}"
   certificate: "${CASDOOR_JWT_CERT}"
+  audience: "${CASDOOR_AUDIENCE:-}"                        # 预期 JWT Audience (aud)，默认取 client_id
+  jwks_uri: "${CASDOOR_JWKS_URI:-}"                        # Casdoor JWKS 端点地址 (如 https://casdoor.example.com/.well-known/jwks)
   organization_name: "your-org"
   application_name: "mcp-app"
   scopes_required:
@@ -37,6 +39,7 @@ sources:
   redis:
     redis-main:
       addr: "${REDIS_ADDR:-127.0.0.1:6379}"
+      username: "${REDIS_USERNAME:-}" # Redis 6 ACL 用户名 (如 mcp_ro)
       password: "${REDIS_PASSWORD:-}"
       allowed_dbs: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
       pool_size: 20
