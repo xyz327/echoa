@@ -1,43 +1,39 @@
 package auth
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/cloudwego/hertz/pkg/app"
-	"github.com/cloudwego/hertz/pkg/app/server"
-	"github.com/cloudwego/hertz/pkg/protocol/consts"
 	"echoa/internal/config"
 )
 
 func TestOAuthProtectedResourceFlow(t *testing.T) {
 	cfg := config.AuthConfig{
 		Enabled:        true,
-		ResourceURL:    "http://127.0.0.1:18091",
 		Endpoint:       "https://casdoor.example.com",
 		ScopesRequired: []string{"openid", "offline_access"},
 	}
 
-	h := server.Default(server.WithHostPorts("127.0.0.1:18091"))
+	// 先占一个端口确定资源地址：PRM 响应体和 WWW-Authenticate 都在 handler 创建时固定下来
+	listener := httptest.NewUnstartedServer(nil)
+	cfg.ResourceURL = "http://" + listener.Listener.Addr().String()
 
-	// 挂载 PRM 接口
-	h.GET("/.well-known/oauth-protected-resource", ProtectedResourceMetadataHandler(cfg))
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /.well-known/oauth-protected-resource", ProtectedResourceMetadataHandler(cfg))
+	mux.Handle("GET /sse", CasdoorMiddleware(cfg, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})))
 
-	// 挂载受保护接口
-	authMw := CasdoorMiddleware(cfg, nil)
-	h.GET("/sse", authMw, func(ctx context.Context, c *app.RequestContext) {
-		c.Status(consts.StatusOK)
-	})
-
-	go h.Spin()
-	time.Sleep(200 * time.Millisecond)
+	listener.Config.Handler = mux
+	listener.Start()
+	defer listener.Close()
+	srv := listener
 
 	// 1. 测试直接请求受保护接口，未携带 Token -> 必须返回 401 + WWW-Authenticate 头
-	resp, err := http.Get("http://127.0.0.1:18091/sse")
+	resp, err := http.Get(srv.URL + "/sse")
 	if err != nil {
 		t.Fatalf("failed to request /sse: %v", err)
 	}
@@ -49,7 +45,7 @@ func TestOAuthProtectedResourceFlow(t *testing.T) {
 
 	authHeader := resp.Header.Get("WWW-Authenticate")
 	t.Logf("Received WWW-Authenticate header: %s", authHeader)
-	if !strings.Contains(authHeader, `resource_metadata="http://127.0.0.1:18091/.well-known/oauth-protected-resource"`) {
+	if !strings.Contains(authHeader, `resource_metadata="`+cfg.ResourceURL+`/.well-known/oauth-protected-resource"`) {
 		t.Fatalf("expected resource_metadata in WWW-Authenticate, got: %s", authHeader)
 	}
 	if !strings.Contains(authHeader, `scope="openid offline_access"`) {
@@ -57,7 +53,7 @@ func TestOAuthProtectedResourceFlow(t *testing.T) {
 	}
 
 	// 2. 模拟客户端顺着指示访问 PRM 元数据接口
-	prmResp, err := http.Get("http://127.0.0.1:18091/.well-known/oauth-protected-resource")
+	prmResp, err := http.Get(srv.URL + "/.well-known/oauth-protected-resource")
 	if err != nil {
 		t.Fatalf("failed to request PRM: %v", err)
 	}
@@ -73,8 +69,8 @@ func TestOAuthProtectedResourceFlow(t *testing.T) {
 	}
 
 	t.Logf("Decoded PRM metadata: %+v", metadata)
-	if metadata.Resource != "http://127.0.0.1:18091" {
-		t.Errorf("expected resource %s, got %s", "http://127.0.0.1:18091", metadata.Resource)
+	if metadata.Resource != cfg.ResourceURL {
+		t.Errorf("expected resource %s, got %s", cfg.ResourceURL, metadata.Resource)
 	}
 	if len(metadata.AuthorizationServers) == 0 || metadata.AuthorizationServers[0] != "https://casdoor.example.com" {
 		t.Errorf("expected authorization server 'https://casdoor.example.com', got %+v", metadata.AuthorizationServers)

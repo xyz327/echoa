@@ -6,20 +6,28 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/casdoor/casdoor-go-sdk/casdoorsdk"
-	"github.com/cloudwego/hertz/pkg/app"
-	"github.com/cloudwego/hertz/pkg/app/server"
-	"github.com/cloudwego/hertz/pkg/common/utils"
-	"github.com/cloudwego/hertz/pkg/protocol/consts"
-	"github.com/hertz-contrib/sse"
 	"echoa/internal/auth"
 	"echoa/internal/config"
+	"github.com/casdoor/casdoor-go-sdk/casdoorsdk"
 )
+
+// newTestServer 启动一个挂载了 MCP 路由、鉴权关闭的测试服务器。
+func newTestServer(t *testing.T, mcpServer *Server) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	authMw := auth.CasdoorMiddleware(config.AuthConfig{Enabled: false}, nil)
+	mux.Handle("GET /sse", authMw(http.HandlerFunc(mcpServer.HandleSSE)))
+	mux.Handle("POST /message", authMw(http.HandlerFunc(mcpServer.HandleMessage)))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
 
 func TestMCPEndToEnd(t *testing.T) {
 	// 1. 初始化 ToolRegistry 并注册模拟工具
@@ -37,18 +45,11 @@ func TestMCPEndToEnd(t *testing.T) {
 	mcpServer := NewServer(registry)
 	defer mcpServer.Close()
 
-	// 2. 启动测试 Hertz Server
-	h := server.Default(server.WithHostPorts("127.0.0.1:18090"))
-	authMw := auth.CasdoorMiddleware(config.AuthConfig{Enabled: false}, nil)
-
-	h.GET("/sse", authMw, mcpServer.HandleSSE)
-	h.POST("/message", authMw, mcpServer.HandleMessage)
-
-	go h.Spin()
-	time.Sleep(300 * time.Millisecond) // 等待监听就绪
+	// 2. 启动测试服务器
+	srv := newTestServer(t, mcpServer)
 
 	// 3. 发起 GET /sse 请求
-	req, err := http.NewRequest("GET", "http://127.0.0.1:18090/sse", nil)
+	req, err := http.NewRequest("GET", srv.URL+"/sse", nil)
 	if err != nil {
 		t.Fatalf("failed to create SSE request: %v", err)
 	}
@@ -86,7 +87,7 @@ func TestMCPEndToEnd(t *testing.T) {
 	t.Logf("Received endpoint URL: %s", endpointURL)
 
 	// 5. 发送 POST /message (initialize)
-	postURL := "http://127.0.0.1:18090" + endpointURL
+	postURL := srv.URL + endpointURL
 	initPayload := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      1,
@@ -206,17 +207,10 @@ func TestSessionConcurrencyLimit(t *testing.T) {
 	mcpServer := NewServer(registry)
 	defer mcpServer.Close()
 
-	h := server.Default(server.WithHostPorts("127.0.0.1:18092"))
-	authMw := auth.CasdoorMiddleware(config.AuthConfig{Enabled: false}, nil)
-
-	h.GET("/sse", authMw, mcpServer.HandleSSE)
-	h.POST("/message", authMw, mcpServer.HandleMessage)
-
-	go h.Spin()
-	time.Sleep(300 * time.Millisecond)
+	srv := newTestServer(t, mcpServer)
 
 	// 1. 建立 SSE 连接
-	req, err := http.NewRequest("GET", "http://127.0.0.1:18092/sse", nil)
+	req, err := http.NewRequest("GET", srv.URL+"/sse", nil)
 	if err != nil {
 		t.Fatalf("failed to create SSE request: %v", err)
 	}
@@ -242,7 +236,7 @@ func TestSessionConcurrencyLimit(t *testing.T) {
 		}
 	}
 
-	postURL := "http://127.0.0.1:18092" + endpointURL
+	postURL := srv.URL + endpointURL
 
 	// 2. 同时发起 5 个慢任务占用全部并发槽位 (MaxSessionConcurrency = 5)
 	var wg sync.WaitGroup
@@ -370,16 +364,16 @@ func TestResolveEndpointURL(t *testing.T) {
 	sessionID := "test-session-uuid-123"
 
 	// 1. 无代理头，无 resourceURL -> 兜底相对路径
-	c1 := app.NewContext(0)
-	url1 := serverNoResource.resolveEndpointURL(c1, sessionID)
+	req1, _ := http.NewRequest("GET", "/sse", nil)
+	url1 := serverNoResource.resolveEndpointURL(req1, sessionID)
 	expected1 := "/message?sessionId=" + sessionID
 	if url1 != expected1 {
 		t.Errorf("case 1 failed: expected %s, got %s", expected1, url1)
 	}
 
 	// 2. 有 resourceURL，无代理头 -> 使用 resourceURL 前缀
-	c2 := app.NewContext(0)
-	url2 := serverWithResource.resolveEndpointURL(c2, sessionID)
+	req2, _ := http.NewRequest("GET", "/sse", nil)
+	url2 := serverWithResource.resolveEndpointURL(req2, sessionID)
 	expected2 := "https://mcp.internal.example.com/prefix/message?sessionId=" + sessionID
 	if url2 != expected2 {
 		t.Errorf("case 2 failed: expected %s, got %s", expected2, url2)
@@ -387,16 +381,16 @@ func TestResolveEndpointURL(t *testing.T) {
 
 	// 3. 有 resourceURL（带尾部斜杠），验证自动 TrimRight 斜杠
 	serverTrailingSlash := NewServer(nil, "https://mcp.internal.example.com/")
-	url3 := serverTrailingSlash.resolveEndpointURL(c2, sessionID)
+	url3 := serverTrailingSlash.resolveEndpointURL(req2, sessionID)
 	expected3 := "https://mcp.internal.example.com/message?sessionId=" + sessionID
 	if url3 != expected3 {
 		t.Errorf("case 3 failed: expected %s, got %s", expected3, url3)
 	}
 
 	// 4. 有 X-Forwarded-Prefix 头 -> 优先使用 X-Forwarded-Prefix
-	c4 := app.NewContext(0)
-	c4.Request.Header.Set("X-Forwarded-Prefix", "/api/v1/mcp/")
-	url4 := serverWithResource.resolveEndpointURL(c4, sessionID)
+	req4, _ := http.NewRequest("GET", "/sse", nil)
+	req4.Header.Set("X-Forwarded-Prefix", "/api/v1/mcp/")
+	url4 := serverWithResource.resolveEndpointURL(req4, sessionID)
 	expected4 := "/api/v1/mcp/message?sessionId=" + sessionID
 	if url4 != expected4 {
 		t.Errorf("case 4 failed: expected %s, got %s", expected4, url4)
@@ -404,37 +398,30 @@ func TestResolveEndpointURL(t *testing.T) {
 }
 
 func TestHealthEndpoints(t *testing.T) {
-	h := server.Default(server.WithHostPorts("127.0.0.1:18094"))
+	mux := http.NewServeMux()
 
-	// 注册健康检查接口
-	checkReadiness := func(ctx context.Context, c *app.RequestContext) {
-		status := utils.H{
-			"mock_db": "ok",
-		}
-		c.JSON(consts.StatusOK, utils.H{
+	checkReadiness := func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
 			"status":      "ok",
 			"service":     "echoa",
-			"datasources": status,
+			"datasources": map[string]any{"mock_db": "ok"},
 		})
 	}
 
-	h.GET("/health", func(ctx context.Context, c *app.RequestContext) {
-		if string(c.Query("type")) == "ready" {
-			checkReadiness(ctx, c)
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("type") == "ready" {
+			checkReadiness(w, r)
 			return
 		}
-		c.JSON(consts.StatusOK, utils.H{"status": "ok", "service": "echoa"})
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "service": "echoa"})
 	})
+	mux.HandleFunc("GET /health/ready", checkReadiness)
 
-	h.GET("/health/ready", func(ctx context.Context, c *app.RequestContext) {
-		checkReadiness(ctx, c)
-	})
-
-	go h.Spin()
-	time.Sleep(300 * time.Millisecond)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
 
 	// 1. 测试基础 Liveness /health
-	resp, err := http.Get("http://127.0.0.1:18094/health")
+	resp, err := http.Get(srv.URL + "/health")
 	if err != nil {
 		t.Fatalf("GET /health failed: %v", err)
 	}
@@ -449,7 +436,7 @@ func TestHealthEndpoints(t *testing.T) {
 	}
 
 	// 2. 测试 Readiness /health/ready
-	respReady, err := http.Get("http://127.0.0.1:18094/health/ready")
+	respReady, err := http.Get(srv.URL + "/health/ready")
 	if err != nil {
 		t.Fatalf("GET /health/ready failed: %v", err)
 	}
@@ -468,7 +455,7 @@ func TestHealthEndpoints(t *testing.T) {
 	}
 
 	// 3. 测试 /health?type=ready
-	respQueryReady, err := http.Get("http://127.0.0.1:18094/health?type=ready")
+	respQueryReady, err := http.Get(srv.URL + "/health?type=ready")
 	if err != nil {
 		t.Fatalf("GET /health?type=ready failed: %v", err)
 	}
@@ -485,7 +472,7 @@ func TestSessionSendTimeout(t *testing.T) {
 	// 创建一个缓冲区仅为 1 的测试 Session
 	sess := &Session{
 		ID:       "test-timeout-sess",
-		SendChan: make(chan *sse.Event, 1),
+		SendChan: make(chan *Event, 1),
 		Sem:      make(chan struct{}, 5),
 		LastSeen: time.Now(),
 		Ctx:      ctx,

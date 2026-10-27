@@ -9,8 +9,15 @@ import (
 	"time"
 
 	"github.com/casdoor/casdoor-go-sdk/casdoorsdk"
-	"github.com/hertz-contrib/sse"
 )
+
+// Event 是一条待下发的 SSE 事件，由 HTTP 层按规范编码后写出。
+// 保活心跳用 Comment：按 SSE 规范以 ':' 开头的行是注释，客户端不会当成事件。
+type Event struct {
+	Event   string
+	Data    []byte
+	Comment string
+}
 
 const (
 	// MaxSessionConcurrency 每个 Session 允许的最大并发处理请求数
@@ -24,7 +31,7 @@ const (
 type Session struct {
 	ID       string
 	Claims   *casdoorsdk.Claims
-	SendChan chan *sse.Event
+	SendChan chan *Event
 	Sem      chan struct{} // 并发信号量
 	LastSeen time.Time
 	mu       sync.Mutex
@@ -102,7 +109,7 @@ func (s *Session) SendJSONRPCWithTimeout(id any, result any, rpcErr *JSONRPCErro
 	select {
 	case <-s.Ctx.Done():
 		return errors.New("session closed")
-	case s.SendChan <- &sse.Event{Event: "message", Data: data}:
+	case s.SendChan <- &Event{Event: "message", Data: data}:
 		return nil
 	case <-timer.C:
 		return fmt.Errorf("session send timeout after %v: client buffer full or slow receiver", timeout)
@@ -157,7 +164,7 @@ func (m *SessionManager) Create(id string, claims *casdoorsdk.Claims) *Session {
 	sess := &Session{
 		ID:       id,
 		Claims:   claims,
-		SendChan: make(chan *sse.Event, 256),
+		SendChan: make(chan *Event, 256),
 		Sem:      make(chan struct{}, MaxSessionConcurrency),
 		LastSeen: time.Now(),
 		Ctx:      ctx,

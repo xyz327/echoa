@@ -1,6 +1,6 @@
 # Echoa
 
-基于 **Golang + CloudWeGo Hertz + `hertz-contrib/sse`** 构建的企业级只读数据库 Model Context Protocol (MCP) 服务端。内置 **Casdoor OAuth 2.1 鉴权** 与 **RFC 9728 保护资源元数据发现**，为 AI Agent（如 Claude Desktop、Cursor、Cline、LibreChat 等）提供安全受控、深度隔离的 **MySQL** 与 **Redis** 只读分析能力。
+基于 **Golang 原生 `net/http` + `http.NewServeMux`** 构建的企业级只读数据库 Model Context Protocol (MCP) 服务端。内置 **Casdoor OAuth 2.1 鉴权** 与 **RFC 9728 保护资源元数据发现**，为 AI Agent（如 Claude Desktop、Cursor、Cline、LibreChat 等）提供安全受控、深度隔离的 **MySQL** 与 **Redis** 只读分析能力。
 
 参考规范与标准：
 - [MCP Specification (SSE Transport)](https://modelcontextprotocol.io/)
@@ -34,7 +34,7 @@
 
 ## 核心架构特性
 
-1. **高性能流式通信**：基于 CloudWeGo Hertz 原生网络栈与 `hertz-contrib/sse`，直接利用连接劫持（`HijackWriter`）与分块流式输出（`Chunked Writer`），极低内存占用与高并发连接支撑。
+1. **轻量标准流式通信**：基于 Go 标准库 `net/http` 原生 `http.Flusher` 实现轻量级 SSE 传输与分块输出，零第三方框架开销，严格遵循 SSE 规范发送 `: keepalive` 注释心跳，兼容各类反向代理与 CDN。
 2. **标准 Casdoor OAuth 2.1 鉴权**：
    - 严格遵循 RFC 6750，通过 `Authorization: Bearer <jwt>` 标头进行无状态公钥验签。
    - 兼容老旧前端 EventSource 的 URL Query（`?token=...`）模式（已标记为 Deprecated 并记录安全告警）。
@@ -479,7 +479,7 @@ Token 过期后需要手工替换。URL Query 中的 `token` 或 `access_token` 
 .
 ├── cmd/
 │   └── server/
-│       └── main.go                  # 程序主入口：配置加载、模块注册、Hertz 路由挂载、平滑停机
+│       └── main.go                  # 程序主入口：配置加载、模块注册、ServeMux 路由挂载、平滑停机
 ├── config/
 │   └── config.yaml                  # 默认主配置文件（含各安全参数与环境变量占位符）
 ├── internal/
