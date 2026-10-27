@@ -3,7 +3,7 @@
 基于 **Golang 原生 `net/http` + `http.NewServeMux`** 构建的企业级只读数据库 Model Context Protocol (MCP) 服务端。内置 **Casdoor OAuth 2.1 鉴权** 与 **RFC 9728 保护资源元数据发现**，为 AI Agent（如 Claude Desktop、Cursor、Cline、LibreChat 等）提供安全受控、深度隔离的 **MySQL** 与 **Redis** 只读分析能力。
 
 参考规范与标准：
-- [MCP Specification (SSE Transport)](https://modelcontextprotocol.io/)
+- [MCP Specification (Streamable HTTP Transport)](https://modelcontextprotocol.io/)
 - [RFC 9728: OAuth 2.0 Protected Resource Metadata](https://datatracker.ietf.org/doc/html/rfc9728)
 - [googleapis/mcp-toolbox](https://github.com/googleapis/mcp-toolbox)
 - [t8y2/dbx](https://github.com/t8y2/dbx)
@@ -16,7 +16,7 @@
 - [MCP 工具清单与参数定义](#mcp-工具清单与参数定义)
   - [MySQL 工具](#1-mysql-工具)
   - [Redis 工具](#2-redis-工具)
-- [HTTP / SSE 端点速查](#http--sse-端点速查)
+- [HTTP 端点速查](#http-端点速查)
 - [多层安全防护体系](#多层安全防护体系)
 - [配置说明与环境变量](#配置说明与环境变量)
 - [快速开始](#快速开始)
@@ -34,10 +34,10 @@
 
 ## 核心架构特性
 
-1. **轻量标准流式通信**：基于 Go 标准库 `net/http` 原生 `http.Flusher` 实现轻量级 SSE 传输与分块输出，零第三方框架开销，严格遵循 SSE 规范发送 `: keepalive` 注释心跳，兼容各类反向代理与 CDN。
+1. **原生无状态 Streamable HTTP 传输**：基于 Go 标准库 `net/http` 原生 `http.NewServeMux` 与标准 JSON-RPC 2.0，零第三方 Web 框架开销。严格遵循 MCP 2026-07-28 规范，每个请求独立自包含，无会话状态依赖，兼容各类反向代理与水平扩展。
 2. **标准 Casdoor OAuth 2.1 鉴权**：
    - 严格遵循 RFC 6750，通过 `Authorization: Bearer <jwt>` 标头进行无状态公钥验签。
-   - 兼容老旧前端 EventSource 的 URL Query（`?token=...`）模式（已标记为 Deprecated 并记录安全告警）。
+   - 兼容老旧客户端通过 URL Query（`?token=...` / `?access_token=...`）传参的模式（已标记为 Deprecated 并记录安全告警）。
    - 实现 RFC 9728 规范的 Protected Resource Metadata (`/.well-known/oauth-protected-resource`)，支持客户端自动发现认证服务器与 Scope。
 3. **MySQL 深度 AST 防御体系**：
    - 基于 `pingcap/tidb/pkg/parser` 对传入 SQL 做抽象语法树（AST）强校验，仅允许 `SELECT`、`EXPLAIN`、`SHOW`。
@@ -55,7 +55,7 @@
    - 每个 endpoint 是一套独立的无状态 MCP 服务和工具表：`POST /mysql1` 只看得到它引用的 source 的工具，互不干扰。
    - 一个 endpoint 只挂一个 MySQL 时工具名保持 `mysql_query`；同一个 endpoint 挂多个同种类 source 时，工具名带上 source 名字（`orders_mysql_query`），避免互相覆盖。
 6. **无状态传输韧性与可观测性**：
-   - 遵循 MCP 2026-07-28 无状态 Streamable HTTP 规范：无握手、无 Session 状态依赖，每个请求携带版本与能力。
+   - 遵循 MCP 2026-07-28 无状态 Streamable HTTP 规范：无握手、无 Session 状态依赖，通过 `server/discover` 进行能力与版本发现，每个请求通过 HTTP 标头及 `_meta` 携带协议版本与方法校验。
    - 单主体并发限制（默认最多 5 并发）与 HTTP 429 背压，按 endpoint + 鉴权主体（JWT subject / developer）隔离治理。
    - DNS Rebinding 保护（Origin 头严格校验）。
    - 结构化 JSON 审计日志（自动对 `password`、`token`、`secret` 等敏感参数脱敏，单参数超 200 字符缩略）。
@@ -428,6 +428,12 @@ docker run --rm -d -p 8080:8080 \
 ---
 
 ## 客户端接入配置
+
+> **协议版本与客户端兼容性提示**：
+> Echoa 严格遵循 **MCP 2026-07-28 无状态 Streamable HTTP 规范**：
+> - **无握手阶段**：不实现旧版规范的 `initialize` 与 `notifications/initialized`，服务身份与工具能力由 `server/discover` 端点暴露。
+> - **每请求标头校验**：所有 RPC 请求必须携带 `MCP-Protocol-Version: 2026-07-28` 及 `Mcp-Method`（`tools/call` 还需携带 `Mcp-Name`），且请求体 `params._meta["io.modelcontextprotocol/protocolVersion"]` 需与标头一致。
+> - **客户端支持**：接入的客户端需支持 2026-07-28 无状态 HTTP 协议。若客户端仍在发送旧版 `initialize` 握手请求（MCP 2025-11-25 及更早），服务端会因标头缺失返回 400 或因方法未实现返回 404。
 
 推荐使用 **OAuth 自动认证**：配置中只写服务 URL，不要预置 `Authorization`。客户端访问时收到 HTTP 401，从 `WWW-Authenticate` 中的 `resource_metadata` 发现 Casdoor，再打开浏览器完成登录。手工 Bearer Token 仅用于调试、自动化脚本，或不支持 OAuth 发现的客户端。
 
