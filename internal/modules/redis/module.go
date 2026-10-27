@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 	"echoa/internal/config"
 	"echoa/internal/mcp"
+	"github.com/redis/go-redis/v9"
 )
 
 type Module struct {
@@ -37,9 +37,21 @@ func (m *Module) Ping(ctx context.Context) error {
 	return client.Ping(ctx).Err()
 }
 
-func Register(registry *mcp.ToolRegistry, cfg config.RedisConfig) (*Module, error) {
-	if !cfg.Enabled {
-		return nil, nil
+// Register 把一份 Redis 配置注册成一组只读工具。
+// qualify 为 false 时工具名是 redis_execute；同一个 endpoint 挂多个 Redis 时带上 source 名字。
+func Register(registry *mcp.ToolRegistry, name string, cfg config.RedisConfig, qualify bool) (*Module, error) {
+	return registerModule(registry, name, cfg, qualify, nil)
+}
+
+// RegisterExisting 把已经建好连接池的模块再注册到另一个 endpoint 的工具表，不再新开连接。
+func RegisterExisting(registry *mcp.ToolRegistry, name string, m *Module, qualify bool) {
+	_, _ = registerModule(registry, name, m.cfg, qualify, m)
+}
+
+func registerModule(registry *mcp.ToolRegistry, name string, cfg config.RedisConfig, qualify bool, existing *Module) (*Module, error) {
+	if existing != nil {
+		registerTools(registry, name, existing, qualify)
+		return existing, nil
 	}
 
 	allowedMap := make(map[string]bool)
@@ -59,6 +71,10 @@ func Register(registry *mcp.ToolRegistry, cfg config.RedisConfig) (*Module, erro
 		MinIdleConns:    cfg.MinIdleConns,
 		ConnMaxIdleTime: 10 * time.Minute,
 		ConnMaxLifetime: 1 * time.Hour,
+		// min_idle_conns 会在连接池创建时后台预热拨号。go-redis v9 的 dial 默认重试 5 次，
+		// 而且 <= 0 会被当成「用默认值」，所以想只拨一次必须设 1。
+		// Redis 不在时否则每个空闲连接都要白等一轮。命令重试（MaxRetries）保持默认。
+		DialerRetries: 1,
 	}
 
 	m := &Module{
@@ -68,23 +84,41 @@ func Register(registry *mcp.ToolRegistry, cfg config.RedisConfig) (*Module, erro
 		blockedMap: blockedMap,
 	}
 
-	// 启动探活（超时 3 秒），失败打印警告日志以兼顾本地无 DB 开发
-	client, err := m.dbMgr.GetClient(0)
-	if err == nil {
-		pingCtx, pingCancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer pingCancel()
-		if pingErr := client.Ping(pingCtx).Err(); pingErr != nil {
-			log.Printf("[WARN] Failed to ping Redis (%s): %v (server continues to run)", cfg.Addr, pingErr)
-		} else {
-			log.Printf("[INFO] Redis connection ping successful")
-		}
+	pingRedis(m, cfg.Addr)
+	registerTools(registry, name, m, qualify)
+	return m, nil
+}
+
+func pingRedis(m *Module, addr string) {
+	// 启动探活（超时 3 秒），失败打印警告日志以兼顾本地无 DB 开发。
+	// MaxRetries 设 -1 表示不重试：go-redis 把 0 当成「用默认的 3 次」。
+	// 连接池的 dial 重试已经在上面收成一次，这里再关掉命令重试，
+	// 避免本地没起 Redis 时探活被拖住。
+	opts := *m.dbMgr.BaseOptions()
+	opts.DB = 0
+	opts.MaxRetries = -1
+	client := redis.NewClient(&opts)
+	defer client.Close()
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer pingCancel()
+	if pingErr := client.Ping(pingCtx).Err(); pingErr != nil {
+		log.Printf("[WARN] Failed to ping Redis (%s): %v (server continues to run)", addr, pingErr)
+	} else {
+		log.Printf("[INFO] Redis connection ping successful")
+	}
+}
+
+func registerTools(registry *mcp.ToolRegistry, name string, m *Module, qualify bool) {
+	prefix := "redis"
+	if qualify {
+		prefix = name + "_redis"
 	}
 
 	// 1. 注册统一命令网关 redis_execute
 	registry.Register(&mcp.ToolDefinition{
-		Name: "redis_execute",
+		Name: prefix + "_execute",
 		Description: "Execute a read-only Redis command (e.g. GET, HGETALL, LRANGE, SMEMBERS, ZRANGE, TYPE, TTL). " +
-			"Supports optional 'db' argument (0-15, default 0). Dangerous/write commands are strictly forbidden.",
+			"Supports optional 'db' argument (0-15, default 0). Dangerous/write commands are strictly forbidden. Source: " + name + ".",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -110,9 +144,9 @@ func Register(registry *mcp.ToolRegistry, cfg config.RedisConfig) (*Module, erro
 
 	// 2. 注册安全扫描工具 redis_scan_keys
 	registry.Register(&mcp.ToolDefinition{
-		Name: "redis_scan_keys",
+		Name: prefix + "_scan_keys",
 		Description: "Safely search keys matching a glob pattern using SCAN without blocking the server. " +
-			"Supports optional 'db' parameter.",
+			"Supports optional 'db' parameter. Source: " + name + ".",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -138,14 +172,12 @@ func Register(registry *mcp.ToolRegistry, cfg config.RedisConfig) (*Module, erro
 
 	// 3. 注册数据库分布查看工具 redis_list_dbs
 	registry.Register(&mcp.ToolDefinition{
-		Name:        "redis_list_dbs",
-		Description: "List all Redis databases that currently hold keys and their approximate key counts.",
+		Name:        prefix + "_list_dbs",
+		Description: "List all Redis databases that currently hold keys and their approximate key counts. Source: " + name + ".",
 		InputSchema: map[string]any{
 			"type":       "object",
 			"properties": map[string]any{},
 		},
 		Handler: m.HandleListDBs,
 	})
-
-	return m, nil
 }

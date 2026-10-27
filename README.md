@@ -50,18 +50,22 @@
    - 完备连接池生命周期参数（`pool_size`、`min_idle_conns`、10m 空闲超时、1h 存活淘汰），防御云原生网络下的静默断连。
    - 统一命令网关 `redis_execute`，内置命令白名单与硬黑名单防御（阻断 `KEYS`、`FLUSHALL`、`CONFIG`、写操作及手动切库 `SELECT`）。
    - 多类型（`[]string`、`map[string]string`、RESP3 `map[any]any`）双重截断保护（条目上限 + 64KB 响应硬上限）。
-5. **传输韧性与可观测性**：
-   - 单 Session 并发限制（默认最多 5 并发）与 HTTP 429 背压，后台空闲 15 分钟会话自动回收。
-   - SSE 发送通道 5 秒超时熔断防线，杜绝慢客户端或死连接拖垮后端工作协程。
+5. **按 endpoint 隔离的数据源**：
+   - `sources` 按名字声明任意数量的 MySQL 与 Redis 连接，`endpoints` 决定每个连接暴露在哪个路径。
+   - 每个 endpoint 是一套独立的无状态 MCP 服务和工具表：`POST /mysql1` 只看得到它引用的 source 的工具，互不干扰。
+   - 一个 endpoint 只挂一个 MySQL 时工具名保持 `mysql_query`；同一个 endpoint 挂多个同种类 source 时，工具名带上 source 名字（`orders_mysql_query`），避免互相覆盖。
+6. **无状态传输韧性与可观测性**：
+   - 遵循 MCP 2026-07-28 无状态 Streamable HTTP 规范：无握手、无 Session 状态依赖，每个请求携带版本与能力。
+   - 单主体并发限制（默认最多 5 并发）与 HTTP 429 背压，按 endpoint + 鉴权主体（JWT subject / developer）隔离治理。
+   - DNS Rebinding 保护（Origin 头严格校验）。
    - 结构化 JSON 审计日志（自动对 `password`、`token`、`secret` 等敏感参数脱敏，单参数超 200 字符缩略）。
    - K8s 存活（`/health`）与就绪（`/health/ready`）深度数据源探活探针。
-   - 自动反代路由前缀兼容（通过 `X-Forwarded-Prefix` 或配置的 `resource_url` 自动拼装正确的 `/message` 回调端点）。
 
 ---
 
 ## MCP 工具清单与参数定义
 
-服务端向 MCP 客户端暴露 6 个标准 Tool：
+每个 endpoint 向 MCP 客户端暴露它引用的 source 对应的工具。一个 endpoint 只挂一个 MySQL 时是下面这 3 个；Redis 同理。
 
 ### 1. MySQL 工具
 
@@ -167,12 +171,11 @@
 
 ---
 
-## HTTP / SSE 端点速查
+## HTTP 端点速查
 
 | 路径 | 方法 | 鉴权要求 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `/sse` | `GET` | 依配置（Bearer JWT） | MCP SSE 连接入口。连接建立后立即返回首个 `endpoint` 事件以及定期保活心跳 |
-| `/message` | `POST` | 依配置（Bearer JWT） | MCP JSON-RPC 消息交互接口，通过 URL 参数 `sessionId` 绑定对应会话 |
+| `<endpoint>` | `POST` | 依配置（Bearer JWT） | MCP 2026-07-28 无状态 Streamable HTTP JSON-RPC 消息入口。`<endpoint>` 来自配置的 `endpoints[].path`（如 `/mysql`、`/redis`）。GET/DELETE 会明确返回 405 |
 | `/.well-known/oauth-protected-resource` | `GET` | 公开免鉴权 | **RFC 9728 PRM 元数据**，供 AI 客户端自动发现 OAuth 认证端点与 Scope |
 | `/health` | `GET` | 公开免鉴权 | K8s 存活探针 (Liveness)，返回 HTTP 200 `{"status":"ok"}` |
 | `/health/ready` | `GET` | 公开免鉴权 | K8s 就绪探针 (Readiness)，实际探测 MySQL 与 Redis 联通性，不健康时返回 HTTP 503 |
@@ -189,9 +192,10 @@
               Authorization: Bearer <JWT>
               PRM RFC 9728 自动发现 / 无状态验签
                        │
-             [ 2. MCP Session 治理 ]
-              并发限流 (5 并发/Session) + HTTP 429
-              空闲 15 分钟会话超时回收 + 结构化脱敏审计
+             [ 2. MCP 无状态并发治理 ]
+              Origin DNS Rebinding 校验 (HTTP 403)
+              并发限流 (5 并发/主体) + HTTP 429
+              结构化脱敏审计日志 (JSON)
                        │
        ┌───────────────┴───────────────┐
        ▼                               ▼
@@ -217,6 +221,8 @@
 server:
   port: 8080                    # 服务监听端口
   read_timeout_ms: 15000        # HTTP 读取超时时间 (毫秒)
+  allowed_origins: []           # 允许的 Origin 白名单 (留空仅放行无 Origin 与 localhost / 127.0.0.1)
+  max_inflight_per_principal: 5 # 每个 endpoint 单个主体最大并发请求数 (超出 429)
 
 # Casdoor OAuth 2.1 鉴权配置
 auth:
@@ -232,26 +238,26 @@ auth:
     - "openid"
     - "offline_access"
 
-# 只读数据源配置
-datasources:
+# 可命名的只读数据源。名字在 mysql 与 redis 之间全局唯一，endpoint 按名字引用。
+sources:
   mysql:
-    enabled: true
-    dsn: "${MYSQL_DSN:-root:password@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=True&loc=Local&multiStatements=false}"
-    max_open_conns: 20          # 连接池最大打开连接数
-    max_idle_conns: 5           # 连接池最大空闲连接数
-    query_timeout_ms: 5000      # 单次查询超时时间 (毫秒)
-    security:
-      max_limit: 200            # 单次查询强制限制的最大返回行数
-      table_blacklist:          # 敏感表黑名单 (支持 "table" 或 "db.table")
-        - "user_password"
-        - "auth_tokens"
-        - "sys_secret"
+    mysql-main:
+      dsn: "${MYSQL_DSN:-root:password@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=True&loc=Local&multiStatements=false}"
+      max_open_conns: 20          # 连接池最大打开连接数
+      max_idle_conns: 5           # 连接池最大空闲连接数
+      query_timeout_ms: 5000      # 单次查询超时时间 (毫秒)
+      security:
+        max_limit: 200            # 单次查询强制限制的最大返回行数
+        table_blacklist:          # 敏感表黑名单 (支持 "table" 或 "db.table")
+          - "user_password"
+          - "auth_tokens"
+          - "sys_secret"
 
   redis:
-    enabled: true
-    addr: "${REDIS_ADDR:-127.0.0.1:6379}"
-    password: "${REDIS_PASSWORD:-}"
-    allowed_dbs: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] # 允许访问的 DB 列表
+    redis-main:
+      addr: "${REDIS_ADDR:-127.0.0.1:6379}"
+      password: "${REDIS_PASSWORD:-}"
+      allowed_dbs: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] # 允许访问的 DB 列表
     pool_size: 20               # 每个 DB 连接池大小
     min_idle_conns: 5           # 最小空闲连接
     max_items_limit: 200        # 集合/列表类返回元素的最大上限
@@ -296,7 +302,50 @@ datasources:
         - "KEYS"
         - "MONITOR"
         - "INFO"
+
+# 每个 endpoint 是一个独立的 MCP 服务，只暴露它引用的 source 的工具。
+endpoints:
+  - path: /mysql                 # 客户端连接 POST http://host:8080/mysql
+    sources: [mysql-main]
+  - path: /redis
+    sources: [redis-main]
 ```
+
+### 多个同类数据源
+
+同一个种类可以声明多份，每份给一个自己的 endpoint。两个 MySQL 就是两段 source 加两个 path：
+
+```yaml
+sources:
+  mysql:
+    orders:
+      dsn: "${MYSQL_ORDERS_DSN}"
+      security:
+        max_limit: 200
+    billing:
+      dsn: "${MYSQL_BILLING_DSN}"
+      security:
+        max_limit: 100
+        table_blacklist: ["payment_secret"]
+
+endpoints:
+  - path: /mysql1               # 客户端发送 POST http://host:8080/mysql1 ，工具名为 mysql_query
+    sources: [orders]
+  - path: /mysql2               # 客户端发送 POST http://host:8080/mysql2 ，同样是 mysql_query，连的是另一个库
+    sources: [billing]
+```
+
+隔离边界是 endpoint：`POST /mysql1` 的 `tools/list` 看不到 billing 的任何工具，两边的并发限流配额也互不影响。
+
+同一个 endpoint 挂两个同种类 source 也可以，此时工具名会带上 source 名字以免互相覆盖，例如 `orders_mysql_query` 与 `billing_mysql_query`：
+
+```yaml
+endpoints:
+  - path: /mysql
+    sources: [orders, billing]
+```
+
+约束：source 名字在全部种类之间唯一（不能同时有一个叫 `main` 的 MySQL 和一个叫 `main` 的 Redis）；`path` 只能是单段（`/mysql1` 可以，`/db/mysql` 不行），且不能占用 `/health`。同一个 source 被多个 endpoint 引用时只建一个连接池。
 
 ### 关键环境变量对照表
 
@@ -305,9 +354,11 @@ datasources:
 | `MCP_RESOURCE_URL` | `auth.resource_url` | `http://127.0.0.1:8080` |
 | `CASDOOR_CLIENT_SECRET` | `auth.client_secret` | - |
 | `CASDOOR_JWT_CERT` | `auth.certificate` | Casdoor x509 证书内容 |
-| `MYSQL_DSN` | `datasources.mysql.dsn` | `root:password@tcp(127.0.0.1:3306)/test?...` |
-| `REDIS_ADDR` | `datasources.redis.addr` | `127.0.0.1:6379` |
-| `REDIS_PASSWORD` | `datasources.redis.password` | 空 |
+| `MYSQL_DSN` | `sources.mysql.mysql-main.dsn` | `root:password@tcp(127.0.0.1:3306)/test?...` |
+| `REDIS_ADDR` | `sources.redis.redis-main.addr` | `127.0.0.1:6379` |
+| `REDIS_PASSWORD` | `sources.redis.redis-main.password` | 空 |
+
+这三项只是默认配置用的占位符。自己加的 source 用什么环境变量，由那段配置里写的 `${...}` 决定，例如 `${MYSQL_ORDERS_DSN}`。
 
 ---
 
@@ -382,12 +433,14 @@ docker run --rm -d -p 8080:8080 \
 
 自动认证要求 `auth.enabled: true`，且 `auth.resource_url` 必须是客户端实际访问的 HTTPS 地址。Casdoor 需要提供 OAuth 2.1 Authorization Code + PKCE，并建议支持 Dynamic Client Registration；否则客户端可能要求手工填写 Client ID。
 
+URL 指向某个 endpoint 的挂载路径（如 `/mysql`、`/redis`）。默认配置下 MySQL 是 `/mysql`，Redis 是 `/redis`；加了第二个 MySQL 后，再加一条客户端配置指向 `/mysql2`。下面的示例都用 MySQL。
+
 ### 1. Claude Desktop
 
 在 **Settings → Connectors → Add custom connector** 中只填写：
 
 ```text
-https://echoa.example.com/sse
+https://echoa.example.com/mysql
 ```
 
 保存后点击 **Connect**，Claude Desktop 会打开浏览器完成 Casdoor 登录，并自动保存和刷新 Token。不要在连接器中填写 Bearer Token。
@@ -399,8 +452,8 @@ https://echoa.example.com/sse
 {
   "mcpServers": {
     "echoa": {
-      "type": "sse",
-      "url": "https://echoa.example.com/sse"
+      "type": "http",
+      "url": "https://echoa.example.com/mysql"
     }
   }
 }
@@ -411,8 +464,8 @@ https://echoa.example.com/sse
 {
   "mcpServers": {
     "echoa": {
-      "type": "sse",
-      "url": "http://127.0.0.1:8080/sse"
+      "type": "http",
+      "url": "http://127.0.0.1:8080/mysql"
     }
   }
 }
@@ -423,8 +476,8 @@ https://echoa.example.com/sse
 进入 **Settings → Features → MCP Servers → Add new MCP server**：
 
 - **Name**: `echoa`
-- **Type**: `SSE`
-- **URL**: `https://echoa.example.com/sse`
+- **Type**: `HTTP` (Streamable HTTP)
+- **URL**: `https://echoa.example.com/mysql`
 
 保存后 Cursor 会根据 401 挑战启动浏览器登录。Headers 留空；预置 `Authorization` 会让 Cursor 跳过自动登录流程。
 
@@ -436,7 +489,7 @@ https://echoa.example.com/sse
 {
   "mcpServers": {
     "echoa": {
-      "url": "https://echoa.example.com/sse",
+      "url": "https://echoa.example.com/mysql",
       "disabled": false,
       "autoApprove": [
         "mysql_list_tables",
@@ -459,8 +512,8 @@ https://echoa.example.com/sse
 {
   "mcpServers": {
     "echoa": {
-      "type": "sse",
-      "url": "https://echoa.example.com/sse",
+      "type": "http",
+      "url": "https://echoa.example.com/mysql",
       "headers": {
         "Authorization": "Bearer <YOUR_CASDOOR_JWT_TOKEN>"
       }
@@ -479,25 +532,25 @@ Token 过期后需要手工替换。URL Query 中的 `token` 或 `access_token` 
 .
 ├── cmd/
 │   └── server/
-│       └── main.go                  # 程序主入口：配置加载、模块注册、ServeMux 路由挂载、平滑停机
+│       └── main.go                  # 程序主入口：配置加载、按 endpoint 注册模块、ServeMux 路由挂载、平滑停机
 ├── config/
 │   └── config.yaml                  # 默认主配置文件（含各安全参数与环境变量占位符）
+├── docs/
+│   └── mcp-2026-07-28-migration.md  # MCP 2026-07-28 无状态迁移方案说明
 ├── internal/
 │   ├── auth/
 │   │   ├── casdoor.go               # Casdoor JWT 验签中间件、敏感日志脱敏
 │   │   ├── prm.go                   # RFC 9728 保护资源元数据 (PRM) 响应结构与 Handler
 │   │   └── prm_test.go              # PRM 逻辑单元测试
 │   ├── config/
-│   │   └── config.go                # Viper 配置映射、环境变量正则解析与默认兜底注入
+│   │   ├── config.go                # Viper 配置映射、环境变量正则解析与校验
+│   │   └── config_test.go           # 配置加载与端点路由校验单元测试
 │   ├── mcp/
-│   │   ├── dispatcher.go            # JSON-RPC 消息分发（initialize, tools/list, tools/call）与审计
-│   │   ├── handler_message.go       # POST /message 处理器与并发/队列治理
-│   │   ├── handler_sse.go           # GET /sse 处理器、会话分配与 25s 心跳保活
-│   │   ├── integration_test.go      # MCP SSE/Message 端到端全流程集成测试
-│   │   ├── server.go                # MCP 服务端核心上下文与反代路由前缀处理
-│   │   ├── session.go               # Session 生命周期、背压熔断控制
+│   │   ├── integration_test.go      # MCP 2026-07-28 无状态 HTTP 全流程集成测试
+│   │   ├── limiter.go               # 基于鉴权主体的并发限流器 (InflightLimiter)
+│   │   ├── server.go                # MCP 无状态服务端核心 Handler、头校验与 RPC 分发
 │   │   ├── tool.go                  # 工具注册中心 (ToolRegistry)
-│   │   └── types.go                 # MCP 规范 JSON-RPC 协议与能力结构体定义
+│   │   └── types.go                 # MCP 2026-07-28 规范 JSON-RPC 协议与能力结构体定义
 │   └── modules/
 │       ├── mysql/
 │       │   ├── module.go            # MySQL 模块初始化、连接池生命周期与工具注册
@@ -514,6 +567,7 @@ Token 过期后需要手工替换。URL Query 中的 `token` 或 `access_token` 
 ├── .github/workflows/
 │   └── image.yml                    # GitHub Actions 多架构容器镜像构建与发布工作流
 ├── Dockerfile                       # 多阶段轻量 Alpine 生产镜像构建
+```
 ├── docker-compose.yml               # 本地一键联调集成编排文件
 ├── Makefile                         # 常用编译、测试、镜像构建快捷指令
 └── README.md                        # 项目官方文档与使用说明

@@ -31,6 +31,12 @@ func NewMultiDBManager(baseOpts *redis.Options, allowedDBs []int) *MultiDBManage
 	}
 }
 
+// BaseOptions 返回建连参数的副本，供启动探活建一个不影响业务连接池的客户端。
+func (m *MultiDBManager) BaseOptions() *redis.Options {
+	cp := *m.baseOptions
+	return &cp
+}
+
 func (m *MultiDBManager) GetClient(db int) (*redis.Client, error) {
 	if !m.allowedDBs[db] {
 		return nil, fmt.Errorf("access to redis db %d is not permitted by configuration", db)

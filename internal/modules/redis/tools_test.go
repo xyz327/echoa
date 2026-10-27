@@ -7,19 +7,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 	"echoa/internal/config"
+	"github.com/redis/go-redis/v9"
 )
 
 func TestRedisSecurityPolicy(t *testing.T) {
 	cfg := config.RedisConfig{
-		Enabled:    true,
 		Addr:       "127.0.0.1:6379",
 		AllowedDBs: []int{0, 1, 2},
-		Security: struct {
-			AllowedCommands []string `mapstructure:"allowed_commands"`
-			BlockedCommands []string `mapstructure:"blocked_commands"`
-		}{
+		Security: config.RedisSecurityConfig{
 			AllowedCommands: []string{"GET", "HGETALL", "SCAN", "LRANGE"},
 			BlockedCommands: []string{"MONITOR"},
 		},

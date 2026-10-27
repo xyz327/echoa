@@ -7,9 +7,9 @@ import (
 	"log"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
 	"echoa/internal/config"
 	"echoa/internal/mcp"
+	_ "github.com/go-sql-driver/mysql"
 )
 
 type Module struct {
@@ -31,9 +31,22 @@ func (m *Module) Ping(ctx context.Context) error {
 	return m.db.PingContext(ctx)
 }
 
-func Register(registry *mcp.ToolRegistry, cfg config.MySQLConfig) (*Module, error) {
-	if !cfg.Enabled {
-		return nil, nil
+// Register 把一份 MySQL 配置注册成一组只读工具。
+// name 是 source 名字：一个 endpoint 只挂这一个 MySQL 时工具名保持 mysql_query；
+// 同一个 endpoint 挂多个 MySQL 时，工具名带上名字（orders_mysql_query），避免互相覆盖。
+func Register(registry *mcp.ToolRegistry, name string, cfg config.MySQLConfig, qualify bool) (*Module, error) {
+	return registerModule(registry, name, cfg, qualify, nil)
+}
+
+// RegisterExisting 把已经建好连接池的模块再注册到另一个 endpoint 的工具表，不再新开连接。
+func RegisterExisting(registry *mcp.ToolRegistry, name string, m *Module, qualify bool) {
+	_, _ = registerModule(registry, name, m.cfg, qualify, m)
+}
+
+func registerModule(registry *mcp.ToolRegistry, name string, cfg config.MySQLConfig, qualify bool, existing *Module) (*Module, error) {
+	if existing != nil {
+		registerTools(registry, name, existing, qualify)
+		return existing, nil
 	}
 
 	db, err := sql.Open("mysql", cfg.DSN)
@@ -61,12 +74,21 @@ func Register(registry *mcp.ToolRegistry, cfg config.MySQLConfig) (*Module, erro
 		cfg: cfg,
 		db:  db,
 	}
+	registerTools(registry, name, m, qualify)
+	return m, nil
+}
+
+func registerTools(registry *mcp.ToolRegistry, name string, m *Module, qualify bool) {
+	prefix := "mysql"
+	if qualify {
+		prefix = name + "_mysql"
+	}
 
 	// 1. 注册 mysql_list_tables
 	registry.Register(&mcp.ToolDefinition{
-		Name: "mysql_list_tables",
+		Name: prefix + "_list_tables",
 		Description: "List all accessible tables in the current MySQL database with row estimates and metadata. " +
-			"Filtered against table blacklist.",
+			"Filtered against table blacklist. Source: " + name + ".",
 		InputSchema: map[string]any{
 			"type":       "object",
 			"properties": map[string]any{},
@@ -76,8 +98,8 @@ func Register(registry *mcp.ToolRegistry, cfg config.MySQLConfig) (*Module, erro
 
 	// 2. 注册 mysql_describe_table
 	registry.Register(&mcp.ToolDefinition{
-		Name:        "mysql_describe_table",
-		Description: "Get column names, types, nullability, keys, default values, and comments for a specified MySQL table.",
+		Name:        prefix + "_describe_table",
+		Description: "Get column names, types, nullability, keys, default values, and comments for a specified MySQL table. Source: " + name + ".",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -93,9 +115,9 @@ func Register(registry *mcp.ToolRegistry, cfg config.MySQLConfig) (*Module, erro
 
 	// 3. 注册 mysql_query
 	registry.Register(&mcp.ToolDefinition{
-		Name: "mysql_query",
+		Name: prefix + "_query",
 		Description: "Execute a read-only MySQL SQL query (SELECT, EXPLAIN, SHOW). " +
-			"Enforces strict AST verification, table blacklist checks, and automatic LIMIT capping.",
+			"Enforces strict AST verification, table blacklist checks, and automatic LIMIT capping. Source: " + name + ".",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -112,6 +134,4 @@ func Register(registry *mcp.ToolRegistry, cfg config.MySQLConfig) (*Module, erro
 		},
 		Handler: m.HandleQuery,
 	})
-
-	return m, nil
 }

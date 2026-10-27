@@ -1,13 +1,14 @@
 package mcp
 
 import (
-	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,486 +18,560 @@ import (
 	"github.com/casdoor/casdoor-go-sdk/casdoorsdk"
 )
 
-// newTestServer 启动一个挂载了 MCP 路由、鉴权关闭的测试服务器。
-func newTestServer(t *testing.T, mcpServer *Server) *httptest.Server {
+func newTestServer(t *testing.T, srv *Server) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
 	authMw := auth.CasdoorMiddleware(config.AuthConfig{Enabled: false}, nil)
-	mux.Handle("GET /sse", authMw(http.HandlerFunc(mcpServer.HandleSSE)))
-	mux.Handle("POST /message", authMw(http.HandlerFunc(mcpServer.HandleMessage)))
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	return srv
+	mux.Handle(srv.endpointPath, authMw(srv))
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	return ts
 }
 
-func TestMCPEndToEnd(t *testing.T) {
-	// 1. 初始化 ToolRegistry 并注册模拟工具
-	registry := NewToolRegistry()
+func standardHeaders(method, toolName string) map[string]string {
+	h := map[string]string{
+		"Content-Type":         "application/json",
+		"MCP-Protocol-Version": ProtocolVersion20260728,
+		"Mcp-Method":           method,
+	}
+	if toolName != "" {
+		h["Mcp-Name"] = toolName
+	}
+	return h
+}
 
-	registry.Register(&ToolDefinition{
-		Name:        "test_ping",
-		Description: "A ping test tool",
-		InputSchema: map[string]any{"type": "object"},
-		Handler: func(ctx context.Context, claims *casdoorsdk.Claims, args map[string]any) (string, error) {
-			return "pong", nil
-		},
-	})
+func standardBody(id any, method string, params map[string]any) map[string]any {
+	if params == nil {
+		params = map[string]any{}
+	}
+	if _, ok := params["_meta"]; !ok {
+		params["_meta"] = map[string]any{
+			"io.modelcontextprotocol/protocolVersion": ProtocolVersion20260728,
+		}
+	}
+	body := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  method,
+		"params":  params,
+	}
+	if id != nil {
+		body["id"] = id
+	}
+	return body
+}
 
-	mcpServer := NewServer(registry)
-	defer mcpServer.Close()
+func doPOST(t *testing.T, url string, headers map[string]string, body any) (*http.Response, []byte) {
+	t.Helper()
+	var bodyReader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			t.Fatalf("marshal body error: %v", err)
+		}
+		bodyReader = bytes.NewReader(b)
+	}
 
-	// 2. 启动测试服务器
-	srv := newTestServer(t, mcpServer)
-
-	// 3. 发起 GET /sse 请求
-	req, err := http.NewRequest("GET", srv.URL+"/sse", nil)
+	req, err := http.NewRequest(http.MethodPost, url, bodyReader)
 	if err != nil {
-		t.Fatalf("failed to create SSE request: %v", err)
+		t.Fatalf("new request error: %v", err)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		t.Fatalf("SSE request failed: %v", err)
+		t.Fatalf("client.Do error: %v", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected status 200, got %d", resp.StatusCode)
-	}
-
-	reader := bufio.NewReader(resp.Body)
-
-	// 4. 读取首个 endpoint 事件
-	var endpointURL string
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatalf("error reading SSE: %v", err)
-		}
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "data:") {
-			endpointURL = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			break
-		}
-	}
-
-	if !strings.HasPrefix(endpointURL, "/message?sessionId=") {
-		t.Fatalf("unexpected endpoint URL: %s", endpointURL)
-	}
-	t.Logf("Received endpoint URL: %s", endpointURL)
-
-	// 5. 发送 POST /message (initialize)
-	postURL := srv.URL + endpointURL
-	initPayload := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "initialize",
-		"params":  map[string]any{},
-	}
-	body, _ := json.Marshal(initPayload)
-	postResp, err := http.Post(postURL, "application/json", bytes.NewReader(body))
+	respBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		t.Fatalf("POST initialize failed: %v", err)
+		t.Fatalf("read response body error: %v", err)
 	}
-	defer postResp.Body.Close()
+	return resp, respBytes
+}
 
-	if postResp.StatusCode != http.StatusAccepted {
-		t.Fatalf("expected status 202 Accepted, got %d", postResp.StatusCode)
-	}
+func TestMCPMethods405(t *testing.T) {
+	registry := NewToolRegistry()
+	srv := NewServer("/mysql", registry, 5, nil)
+	ts := newTestServer(t, srv)
 
-	// 6. 从 SSE 读取 initialize 返回结果
-	var initResult string
-	for {
-		line, err := reader.ReadString('\n')
+	for _, method := range []string{http.MethodGet, http.MethodDelete, http.MethodPut} {
+		req, _ := http.NewRequest(method, ts.URL+"/mysql", nil)
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			t.Fatalf("error reading SSE init response: %v", err)
+			t.Fatalf("%s request error: %v", method, err)
 		}
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "data:") {
-			initResult = strings.TrimPrefix(line, "data:")
-			break
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("expected 405 for %s, got %d", method, resp.StatusCode)
 		}
-	}
-
-	t.Logf("Received JSON-RPC response: %s", initResult)
-	if !strings.Contains(initResult, "echoa") {
-		t.Fatalf("expected serverInfo 'echoa' in response, got %s", initResult)
-	}
-
-	// 7. 发送 POST /message (tools/list)
-	toolsListPayload := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      2,
-		"method":  "tools/list",
-		"params":  map[string]any{},
-	}
-	body, _ = json.Marshal(toolsListPayload)
-	postResp2, err := http.Post(postURL, "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("POST tools/list failed: %v", err)
-	}
-	defer postResp2.Body.Close()
-
-	var toolsListResult string
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatalf("error reading SSE tools/list response: %v", err)
+		if allow := resp.Header.Get("Allow"); allow != "POST" {
+			t.Errorf("expected Allow: POST, got %q", allow)
 		}
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "data:") {
-			toolsListResult = strings.TrimPrefix(line, "data:")
-			break
-		}
-	}
-	t.Logf("Received tools/list response: %s", toolsListResult)
-	if !strings.Contains(toolsListResult, "test_ping") {
-		t.Fatalf("expected test_ping in tools list, got %s", toolsListResult)
-	}
-
-	// 8. 发送 POST /message (tools/call test_ping)
-	callPayload := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      3,
-		"method":  "tools/call",
-		"params": map[string]any{
-			"name":      "test_ping",
-			"arguments": map[string]any{},
-		},
-	}
-	body, _ = json.Marshal(callPayload)
-	postResp3, err := http.Post(postURL, "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("POST tools/call failed: %v", err)
-	}
-	defer postResp3.Body.Close()
-
-	var callResult string
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatalf("error reading SSE tools/call response: %v", err)
-		}
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "data:") {
-			callResult = strings.TrimPrefix(line, "data:")
-			break
-		}
-	}
-	t.Logf("Received tools/call response: %s", callResult)
-	if !strings.Contains(callResult, "pong") {
-		t.Fatalf("expected 'pong' in result, got %s", callResult)
 	}
 }
 
-func TestSessionConcurrencyLimit(t *testing.T) {
+func TestMCPOriginValidation(t *testing.T) {
 	registry := NewToolRegistry()
+	srv := NewServer("/mysql", registry, 5, []string{"https://allowed.example.com"})
+	ts := newTestServer(t, srv)
 
-	// 注册一个执行 300ms 的慢工具
+	headers := standardHeaders("server/discover", "")
+	body := standardBody(1, "server/discover", nil)
+
+	// 1. 无 Origin：应允许
+	resp, _ := doPOST(t, ts.URL+"/mysql", headers, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 for empty Origin, got %d", resp.StatusCode)
+	}
+
+	// 2. 匹配 allowed_origins：应允许
+	headers["Origin"] = "https://allowed.example.com"
+	resp, _ = doPOST(t, ts.URL+"/mysql", headers, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 for allowed Origin, got %d", resp.StatusCode)
+	}
+
+	// 3. 不匹配 Origin：应返回 403 Forbidden
+	headers["Origin"] = "https://malicious.example.com"
+	resp, respBytes := doPOST(t, ts.URL+"/mysql", headers, body)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("expected 403 for disallowed Origin, got %d", resp.StatusCode)
+	}
+	var rpcErr JSONRPCResponse
+	_ = json.Unmarshal(respBytes, &rpcErr)
+	if rpcErr.Error == nil {
+		t.Errorf("expected JSON-RPC error in 403 response, got %s", string(respBytes))
+	}
+}
+
+func TestMCPHeaderValidation(t *testing.T) {
+	registry := NewToolRegistry()
 	registry.Register(&ToolDefinition{
-		Name:        "test_slow",
-		Description: "A slow test tool",
+		Name:        "test_tool",
+		Description: "test tool",
 		InputSchema: map[string]any{"type": "object"},
 		Handler: func(ctx context.Context, claims *casdoorsdk.Claims, args map[string]any) (string, error) {
-			time.Sleep(300 * time.Millisecond)
+			return "ok", nil
+		},
+	})
+	srv := NewServer("/mysql", registry, 5, nil)
+	ts := newTestServer(t, srv)
+
+	// 1. 缺少 MCP-Protocol-Version 头 -> 400, code -32020
+	h1 := standardHeaders("server/discover", "")
+	delete(h1, "MCP-Protocol-Version")
+	resp, respBytes := doPOST(t, ts.URL+"/mysql", h1, standardBody(1, "server/discover", nil))
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for missing MCP-Protocol-Version, got %d", resp.StatusCode)
+	}
+	var errResp JSONRPCResponse
+	_ = json.Unmarshal(respBytes, &errResp)
+	if errResp.Error == nil || errResp.Error.Code != ErrCodeHeaderMismatch {
+		t.Errorf("expected error code %d, got %v", ErrCodeHeaderMismatch, errResp.Error)
+	}
+
+	// 2. 头部协议版本与 body _meta 不一致 -> 400, code -32020
+	h2 := standardHeaders("server/discover", "")
+	b2 := standardBody(1, "server/discover", map[string]any{
+		"_meta": map[string]any{
+			"io.modelcontextprotocol/protocolVersion": "2025-11-25",
+		},
+	})
+	resp, respBytes = doPOST(t, ts.URL+"/mysql", h2, b2)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for version mismatch, got %d", resp.StatusCode)
+	}
+	_ = json.Unmarshal(respBytes, &errResp)
+	if errResp.Error == nil || errResp.Error.Code != ErrCodeHeaderMismatch {
+		t.Errorf("expected error code %d, got %v", ErrCodeHeaderMismatch, errResp.Error)
+	}
+
+	// 3. 不支持的协议版本 -> 400, code -32022
+	h3 := standardHeaders("server/discover", "")
+	h3["MCP-Protocol-Version"] = "2025-11-25"
+	b3 := standardBody(1, "server/discover", map[string]any{
+		"_meta": map[string]any{
+			"io.modelcontextprotocol/protocolVersion": "2025-11-25",
+		},
+	})
+	resp, respBytes = doPOST(t, ts.URL+"/mysql", h3, b3)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for unsupported version, got %d", resp.StatusCode)
+	}
+	_ = json.Unmarshal(respBytes, &errResp)
+	if errResp.Error == nil || errResp.Error.Code != ErrCodeUnsupportedProtocolVersion {
+		t.Errorf("expected error code %d, got %v", ErrCodeUnsupportedProtocolVersion, errResp.Error)
+	}
+
+	// 4. 缺少 Mcp-Method 头 -> 400, code -32020
+	h4 := standardHeaders("server/discover", "")
+	delete(h4, "Mcp-Method")
+	resp, _ = doPOST(t, ts.URL+"/mysql", h4, standardBody(1, "server/discover", nil))
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for missing Mcp-Method, got %d", resp.StatusCode)
+	}
+
+	// 5. Mcp-Method 与 body method 不一致 -> 400, code -32020
+	h5 := standardHeaders("server/discover", "")
+	h5["Mcp-Method"] = "tools/list"
+	resp, _ = doPOST(t, ts.URL+"/mysql", h5, standardBody(1, "server/discover", nil))
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for Mcp-Method mismatch, got %d", resp.StatusCode)
+	}
+
+	// 6. tools/call 缺少 Mcp-Name -> 400, code -32020
+	h6 := standardHeaders("tools/call", "")
+	b6 := standardBody(1, "tools/call", map[string]any{
+		"name":      "test_tool",
+		"arguments": map[string]any{},
+	})
+	resp, _ = doPOST(t, ts.URL+"/mysql", h6, b6)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for missing Mcp-Name on tools/call, got %d", resp.StatusCode)
+	}
+
+	// 7. tools/call Mcp-Name 不匹配 -> 400, code -32020
+	h7 := standardHeaders("tools/call", "wrong_tool")
+	resp, _ = doPOST(t, ts.URL+"/mysql", h7, b6)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for mismatched Mcp-Name, got %d", resp.StatusCode)
+	}
+
+	// 8. tools/call 采用 Base64 sentinel 编码 Mcp-Name -> 应成功解码并匹配执行
+	encodedName := "=?base64?" + base64.StdEncoding.EncodeToString([]byte("test_tool")) + "?="
+	h8 := standardHeaders("tools/call", encodedName)
+	resp, _ = doPOST(t, ts.URL+"/mysql", h8, b6)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 for Base64 encoded Mcp-Name, got %d", resp.StatusCode)
+	}
+
+	// 9. 携带旧版 Mcp-Session-Id 头 -> 应忽略并不影响执行
+	h9 := standardHeaders("tools/call", "test_tool")
+	h9["Mcp-Session-Id"] = "legacy-session-uuid"
+	resp, _ = doPOST(t, ts.URL+"/mysql", h9, b6)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 when Mcp-Session-Id is present, got %d", resp.StatusCode)
+	}
+	if resp.Header.Get("Mcp-Session-Id") != "" {
+		t.Errorf("server must not echo or mint Mcp-Session-Id header")
+	}
+}
+
+func TestMCPNotification(t *testing.T) {
+	registry := NewToolRegistry()
+	srv := NewServer("/mysql", registry, 5, nil)
+	ts := newTestServer(t, srv)
+
+	// 没有 id 的请求视为 Notification -> 202 Accepted 无包体
+	headers := map[string]string{"Content-Type": "application/json"}
+	body := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "notifications/initialized",
+	}
+	resp, respBytes := doPOST(t, ts.URL+"/mysql", headers, body)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Errorf("expected 202 Accepted for notification, got %d", resp.StatusCode)
+	}
+	if len(respBytes) > 0 {
+		t.Errorf("expected empty body for 202 Accepted, got %s", string(respBytes))
+	}
+}
+
+func TestServerDiscover(t *testing.T) {
+	registry := NewToolRegistry()
+	srv := NewServer("/mysql", registry, 5, nil)
+	ts := newTestServer(t, srv)
+
+	headers := standardHeaders("server/discover", "")
+	body := standardBody("disc-1", "server/discover", nil)
+
+	resp, respBytes := doPOST(t, ts.URL+"/mysql", headers, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var rpcResp struct {
+		JSONRPC string         `json:"jsonrpc"`
+		ID      any            `json:"id"`
+		Result  DiscoverResult `json:"result"`
+	}
+	if err := json.Unmarshal(respBytes, &rpcResp); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+
+	if rpcResp.Result.ResultType != "complete" {
+		t.Errorf("expected resultType 'complete', got %q", rpcResp.Result.ResultType)
+	}
+	if len(rpcResp.Result.SupportedVersions) != 1 || rpcResp.Result.SupportedVersions[0] != ProtocolVersion20260728 {
+		t.Errorf("expected supportedVersions [2026-07-28], got %v", rpcResp.Result.SupportedVersions)
+	}
+	if rpcResp.Result.TTLMs <= 0 || rpcResp.Result.CacheScope != "public" {
+		t.Errorf("expected cache hints, got ttlMs=%d, cacheScope=%s", rpcResp.Result.TTLMs, rpcResp.Result.CacheScope)
+	}
+}
+
+func TestToolsList(t *testing.T) {
+	registry := NewToolRegistry()
+	// 乱序注册，验证 tools/list 字典序稳定输出
+	registry.Register(&ToolDefinition{Name: "zebra_tool", Description: "z"})
+	registry.Register(&ToolDefinition{Name: "apple_tool", Description: "a"})
+	registry.Register(&ToolDefinition{Name: "monkey_tool", Description: "m"})
+
+	srv := NewServer("/mysql", registry, 5, nil)
+	ts := newTestServer(t, srv)
+
+	headers := standardHeaders("tools/list", "")
+	body := standardBody(10, "tools/list", nil)
+
+	resp, respBytes := doPOST(t, ts.URL+"/mysql", headers, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var rpcResp struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      any             `json:"id"`
+		Result  ListToolsResult `json:"result"`
+	}
+	if err := json.Unmarshal(respBytes, &rpcResp); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+
+	if rpcResp.Result.ResultType != "complete" {
+		t.Errorf("expected resultType 'complete', got %s", rpcResp.Result.ResultType)
+	}
+	if len(rpcResp.Result.Tools) != 3 {
+		t.Fatalf("expected 3 tools, got %d", len(rpcResp.Result.Tools))
+	}
+	// 验证排序：apple_tool, monkey_tool, zebra_tool
+	expectedNames := []string{"apple_tool", "monkey_tool", "zebra_tool"}
+	for i, name := range expectedNames {
+		if rpcResp.Result.Tools[i].Name != name {
+			t.Errorf("tool[%d] name expected %s, got %s", i, name, rpcResp.Result.Tools[i].Name)
+		}
+	}
+}
+
+func TestToolsCall(t *testing.T) {
+	registry := NewToolRegistry()
+	registry.Register(&ToolDefinition{
+		Name:        "echo_tool",
+		Description: "echoes message",
+		InputSchema: map[string]any{"type": "object"},
+		Handler: func(ctx context.Context, claims *casdoorsdk.Claims, args map[string]any) (string, error) {
+			msg, _ := args["message"].(string)
+			if msg == "fail" {
+				return "", fmt.Errorf("intentional error")
+			}
+			return "echo: " + msg, nil
+		},
+	})
+
+	srv := NewServer("/mysql", registry, 5, nil)
+	ts := newTestServer(t, srv)
+
+	// 1. 成功调用
+	headers := standardHeaders("tools/call", "echo_tool")
+	body := standardBody("call-1", "tools/call", map[string]any{
+		"name": "echo_tool",
+		"arguments": map[string]any{
+			"message":  "hello world",
+			"password": "secret-password", // 脱敏测试
+		},
+	})
+
+	resp, respBytes := doPOST(t, ts.URL+"/mysql", headers, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var rpcResp struct {
+		JSONRPC string         `json:"jsonrpc"`
+		ID      any            `json:"id"`
+		Result  CallToolResult `json:"result"`
+	}
+	if err := json.Unmarshal(respBytes, &rpcResp); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if rpcResp.Result.ResultType != "complete" || rpcResp.Result.IsError {
+		t.Errorf("expected success complete result, got %+v", rpcResp.Result)
+	}
+	if len(rpcResp.Result.Content) == 0 || rpcResp.Result.Content[0].Text != "echo: hello world" {
+		t.Errorf("unexpected content: %+v", rpcResp.Result.Content)
+	}
+
+	// 2. 工具内部报错 -> HTTP 200, Result.IsError = true (不作为 JSON-RPC 协议错误)
+	bodyFail := standardBody("call-2", "tools/call", map[string]any{
+		"name": "echo_tool",
+		"arguments": map[string]any{
+			"message": "fail",
+		},
+	})
+	resp, respBytes = doPOST(t, ts.URL+"/mysql", headers, bodyFail)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	_ = json.Unmarshal(respBytes, &rpcResp)
+	if !rpcResp.Result.IsError {
+		t.Errorf("expected isError: true on tool failure, got false")
+	}
+
+	// 3. 调用不存在的工具
+	hNotExist := standardHeaders("tools/call", "not_exist")
+	bodyNotExist := standardBody("call-3", "tools/call", map[string]any{
+		"name":      "not_exist",
+		"arguments": map[string]any{},
+	})
+	resp, respBytes = doPOST(t, ts.URL+"/mysql", hNotExist, bodyNotExist)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	_ = json.Unmarshal(respBytes, &rpcResp)
+	if !rpcResp.Result.IsError {
+		t.Errorf("expected isError: true for not found tool")
+	}
+}
+
+func TestUnknownMethod404(t *testing.T) {
+	registry := NewToolRegistry()
+	srv := NewServer("/mysql", registry, 5, nil)
+	ts := newTestServer(t, srv)
+
+	// 旧协议的 initialize 方法在 2026-07-28 中已移除，应返回 404 Method not found (-32601)
+	headers := standardHeaders("initialize", "")
+	body := standardBody(1, "initialize", nil)
+
+	resp, respBytes := doPOST(t, ts.URL+"/mysql", headers, body)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404 for unknown method, got %d", resp.StatusCode)
+	}
+
+	var rpcErr JSONRPCResponse
+	_ = json.Unmarshal(respBytes, &rpcErr)
+	if rpcErr.Error == nil || rpcErr.Error.Code != ErrCodeMethodNotFound {
+		t.Errorf("expected code %d, got %v", ErrCodeMethodNotFound, rpcErr.Error)
+	}
+}
+
+func TestInflightConcurrencyLimit429(t *testing.T) {
+	registry := NewToolRegistry()
+	holdChan := make(chan struct{})
+	startedChan := make(chan struct{}, 10)
+
+	registry.Register(&ToolDefinition{
+		Name:        "slow_tool",
+		Description: "blocks until holdChan is closed",
+		InputSchema: map[string]any{"type": "object"},
+		Handler: func(ctx context.Context, claims *casdoorsdk.Claims, args map[string]any) (string, error) {
+			startedChan <- struct{}{}
+			<-holdChan
 			return "done", nil
 		},
 	})
 
-	mcpServer := NewServer(registry)
-	defer mcpServer.Close()
+	maxInflight := 3
+	srv := NewServer("/mysql", registry, maxInflight, nil)
+	ts := newTestServer(t, srv)
 
-	srv := newTestServer(t, mcpServer)
+	headers := standardHeaders("tools/call", "slow_tool")
+	body := standardBody("req", "tools/call", map[string]any{
+		"name":      "slow_tool",
+		"arguments": map[string]any{},
+	})
 
-	// 1. 建立 SSE 连接
-	req, err := http.NewRequest("GET", srv.URL+"/sse", nil)
-	if err != nil {
-		t.Fatalf("failed to create SSE request: %v", err)
-	}
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		t.Fatalf("SSE request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	reader := bufio.NewReader(resp.Body)
-	var endpointURL string
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatalf("error reading SSE: %v", err)
-		}
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "data:") {
-			endpointURL = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			break
-		}
-	}
-
-	postURL := srv.URL + endpointURL
-
-	// 2. 同时发起 5 个慢任务占用全部并发槽位 (MaxSessionConcurrency = 5)
 	var wg sync.WaitGroup
-	var acceptedCount int
-	var countMu sync.Mutex
-
-	for i := 0; i < 5; i++ {
+	for i := 0; i < maxInflight; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			payload := map[string]any{
-				"jsonrpc": "2.0",
-				"id":      id,
-				"method":  "tools/call",
-				"params": map[string]any{
-					"name":      "test_slow",
-					"arguments": map[string]any{},
-				},
+			b := standardBody(id, "tools/call", map[string]any{
+				"name":      "slow_tool",
+				"arguments": map[string]any{},
+			})
+			resp, _ := doPOST(t, ts.URL+"/mysql", headers, b)
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("request %d expected 200, got %d", id, resp.StatusCode)
 			}
-			b, _ := json.Marshal(payload)
-			pResp, pErr := http.Post(postURL, "application/json", bytes.NewReader(b))
-			if pErr == nil {
-				defer pResp.Body.Close()
-				if pResp.StatusCode == http.StatusAccepted {
-					countMu.Lock()
-					acceptedCount++
-					countMu.Unlock()
-				}
-			}
-		}(i + 10)
+		}(i)
 	}
 
-	// 稍微等待确保 5 个请求已进入执行中
-	time.Sleep(50 * time.Millisecond)
-
-	// 3. 发送第 6 个请求 -> 槽位已满，必须返回 429 Too Many Requests
-	sixthPayload := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      99,
-		"method":  "tools/call",
-		"params": map[string]any{
-			"name":      "test_slow",
-			"arguments": map[string]any{},
-		},
-	}
-	sixthBody, _ := json.Marshal(sixthPayload)
-	sixthResp, err := http.Post(postURL, "application/json", bytes.NewReader(sixthBody))
-	if err != nil {
-		t.Fatalf("sixth request failed: %v", err)
-	}
-	defer sixthResp.Body.Close()
-
-	if sixthResp.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("expected 6th request to be 429 Too Many Requests, got: %d", sixthResp.StatusCode)
-	}
-
-	var errResp map[string]any
-	_ = json.NewDecoder(sixthResp.Body).Decode(&errResp)
-	t.Logf("Received expected 429 response: %+v", errResp)
-
-	wg.Wait()
-	if acceptedCount != 5 {
-		t.Errorf("expected 5 requests to be accepted, got: %d", acceptedCount)
-	}
-	// 等待 5 个后台 goroutine 顺利执行完
-	time.Sleep(350 * time.Millisecond)
-}
-
-func TestSanitizeAuditArgs(t *testing.T) {
-	// 1. 测试空入参
-	emptyResult := sanitizeAuditArgs(nil)
-	if len(emptyResult) != 0 {
-		t.Errorf("expected empty map, got %v", emptyResult)
-	}
-
-	// 2. 测试敏感 Key 脱敏与大文本截断
-	longQuery := strings.Repeat("SELECT * FROM users WHERE id = 1 AND ", 10) // > 200 字符
-	rawArgs := map[string]any{
-		"query":      longQuery,
-		"password":   "super_secret_123",
-		"Token":      "jwt-token-string",
-		"SECRET":     "my_secret",
-		"Credential": "secret_cred",
-		"auth":       "bearer token",
-		"api_key":    "not_exact_key",
-		"key":        "sensitive_key_val",
-		"max_rows":   100,
-		"is_active":  true,
-	}
-
-	sanitized := sanitizeAuditArgs(rawArgs)
-
-	// 验证敏感字段脱敏
-	for _, k := range []string{"password", "Token", "SECRET", "Credential", "auth", "key"} {
-		if val, ok := sanitized[k]; !ok || val != "[REDACTED]" {
-			t.Errorf("expected key %s to be [REDACTED], got %v", k, val)
+	// 等待前 3 个慢请求均已进入 handler
+	for i := 0; i < maxInflight; i++ {
+		select {
+		case <-startedChan:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for slow tasks to start")
 		}
 	}
 
-	// 验证普通安全字段未脱敏
-	if sanitized["max_rows"] != 100 {
-		t.Errorf("expected max_rows to be 100, got %v", sanitized["max_rows"])
-	}
-	if sanitized["is_active"] != true {
-		t.Errorf("expected is_active to be true, got %v", sanitized["is_active"])
-	}
-
-	// 验证超长文本截断
-	qVal, ok := sanitized["query"].(string)
-	if !ok {
-		t.Fatalf("expected query to be string, got %T", sanitized["query"])
-	}
-	if !strings.HasSuffix(qVal, "... [truncated]") {
-		t.Errorf("expected truncated string to end with '... [truncated]', got: %s", qVal)
-	}
-	if len(qVal) != 200+len("... [truncated]") {
-		t.Errorf("unexpected length for truncated query: %d", len(qVal))
-	}
-}
-
-func TestResolveEndpointURL(t *testing.T) {
-	serverNoResource := NewServer(nil)
-	serverWithResource := NewServer(nil, "https://mcp.internal.example.com/prefix")
-
-	sessionID := "test-session-uuid-123"
-
-	// 1. 无代理头，无 resourceURL -> 兜底相对路径
-	req1, _ := http.NewRequest("GET", "/sse", nil)
-	url1 := serverNoResource.resolveEndpointURL(req1, sessionID)
-	expected1 := "/message?sessionId=" + sessionID
-	if url1 != expected1 {
-		t.Errorf("case 1 failed: expected %s, got %s", expected1, url1)
-	}
-
-	// 2. 有 resourceURL，无代理头 -> 使用 resourceURL 前缀
-	req2, _ := http.NewRequest("GET", "/sse", nil)
-	url2 := serverWithResource.resolveEndpointURL(req2, sessionID)
-	expected2 := "https://mcp.internal.example.com/prefix/message?sessionId=" + sessionID
-	if url2 != expected2 {
-		t.Errorf("case 2 failed: expected %s, got %s", expected2, url2)
-	}
-
-	// 3. 有 resourceURL（带尾部斜杠），验证自动 TrimRight 斜杠
-	serverTrailingSlash := NewServer(nil, "https://mcp.internal.example.com/")
-	url3 := serverTrailingSlash.resolveEndpointURL(req2, sessionID)
-	expected3 := "https://mcp.internal.example.com/message?sessionId=" + sessionID
-	if url3 != expected3 {
-		t.Errorf("case 3 failed: expected %s, got %s", expected3, url3)
-	}
-
-	// 4. 有 X-Forwarded-Prefix 头 -> 优先使用 X-Forwarded-Prefix
-	req4, _ := http.NewRequest("GET", "/sse", nil)
-	req4.Header.Set("X-Forwarded-Prefix", "/api/v1/mcp/")
-	url4 := serverWithResource.resolveEndpointURL(req4, sessionID)
-	expected4 := "/api/v1/mcp/message?sessionId=" + sessionID
-	if url4 != expected4 {
-		t.Errorf("case 4 failed: expected %s, got %s", expected4, url4)
-	}
-}
-
-func TestHealthEndpoints(t *testing.T) {
-	mux := http.NewServeMux()
-
-	checkReadiness := func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"status":      "ok",
-			"service":     "echoa",
-			"datasources": map[string]any{"mock_db": "ok"},
-		})
-	}
-
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("type") == "ready" {
-			checkReadiness(w, r)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "service": "echoa"})
+	// 第 4 个并发请求应被限流阻断，返回 HTTP 429
+	b4 := standardBody("overflow", "tools/call", map[string]any{
+		"name":      "slow_tool",
+		"arguments": map[string]any{},
 	})
-	mux.HandleFunc("GET /health/ready", checkReadiness)
-
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	// 1. 测试基础 Liveness /health
-	resp, err := http.Get(srv.URL + "/health")
-	if err != nil {
-		t.Fatalf("GET /health failed: %v", err)
+	resp, respBytes := doPOST(t, ts.URL+"/mysql", headers, b4)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("expected 429 TooManyRequests for exceeding limit, got %d", resp.StatusCode)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("expected 200 OK, got %d", resp.StatusCode)
-	}
-	var livenessBody map[string]any
-	_ = json.NewDecoder(resp.Body).Decode(&livenessBody)
-	if livenessBody["status"] != "ok" || livenessBody["service"] != "echoa" {
-		t.Errorf("unexpected liveness body: %+v", livenessBody)
+	var rpcErr JSONRPCResponse
+	_ = json.Unmarshal(respBytes, &rpcErr)
+	if rpcErr.Error == nil || rpcErr.Error.Code != ErrCodeTooManyRequests {
+		t.Errorf("expected rpc error %d, got %v", ErrCodeTooManyRequests, rpcErr.Error)
 	}
 
-	// 2. 测试 Readiness /health/ready
-	respReady, err := http.Get(srv.URL + "/health/ready")
-	if err != nil {
-		t.Fatalf("GET /health/ready failed: %v", err)
-	}
-	defer respReady.Body.Close()
-	if respReady.StatusCode != http.StatusOK {
-		t.Errorf("expected 200 OK, got %d", respReady.StatusCode)
-	}
-	var readyBody map[string]any
-	_ = json.NewDecoder(respReady.Body).Decode(&readyBody)
-	if readyBody["status"] != "ok" {
-		t.Errorf("unexpected readiness status: %+v", readyBody)
-	}
-	ds, ok := readyBody["datasources"].(map[string]any)
-	if !ok || ds["mock_db"] != "ok" {
-		t.Errorf("unexpected datasources: %+v", readyBody)
-	}
+	// 释放阻塞通道，等待前 3 个任务正常结束
+	close(holdChan)
+	wg.Wait()
 
-	// 3. 测试 /health?type=ready
-	respQueryReady, err := http.Get(srv.URL + "/health?type=ready")
-	if err != nil {
-		t.Fatalf("GET /health?type=ready failed: %v", err)
-	}
-	defer respQueryReady.Body.Close()
-	if respQueryReady.StatusCode != http.StatusOK {
-		t.Errorf("expected 200 OK, got %d", respQueryReady.StatusCode)
+	// 槽位归还后，新请求能够正常获取槽位执行
+	holdAgain := make(chan struct{})
+	close(holdAgain)
+	resp2, _ := doPOST(t, ts.URL+"/mysql", headers, body)
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 after slots freed, got %d", resp2.StatusCode)
 	}
 }
 
-func TestSessionSendTimeout(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func TestEndpointIsolation(t *testing.T) {
+	mux := http.NewServeMux()
+	authMw := auth.CasdoorMiddleware(config.AuthConfig{Enabled: false}, nil)
 
-	// 创建一个缓冲区仅为 1 的测试 Session
-	sess := &Session{
-		ID:       "test-timeout-sess",
-		SendChan: make(chan *Event, 1),
-		Sem:      make(chan struct{}, 5),
-		LastSeen: time.Now(),
-		Ctx:      ctx,
-		Cancel:   cancel,
+	reg1 := NewToolRegistry()
+	reg1.Register(&ToolDefinition{Name: "mysql1_tool", Description: "t1"})
+	srv1 := NewServer("/mysql1", reg1, 5, nil)
+	mux.Handle("/mysql1", authMw(srv1))
+
+	reg2 := NewToolRegistry()
+	reg2.Register(&ToolDefinition{Name: "mysql2_tool", Description: "t2"})
+	srv2 := NewServer("/mysql2", reg2, 5, nil)
+	mux.Handle("/mysql2", authMw(srv2))
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// 1. 请求 /mysql1 只能看到 mysql1_tool
+	h1 := standardHeaders("tools/list", "")
+	b1 := standardBody(1, "tools/list", nil)
+	_, resp1 := doPOST(t, ts.URL+"/mysql1", h1, b1)
+	var r1 struct {
+		Result ListToolsResult `json:"result"`
+	}
+	_ = json.Unmarshal(resp1, &r1)
+	if len(r1.Result.Tools) != 1 || r1.Result.Tools[0].Name != "mysql1_tool" {
+		t.Errorf("unexpected tools on /mysql1: %+v", r1.Result.Tools)
 	}
 
-	// 1. 发送第 1 个包，填满缓冲区
-	err := sess.SendJSONRPCWithTimeout(1, "payload1", nil, 50*time.Millisecond)
-	if err != nil {
-		t.Fatalf("first send should succeed, got: %v", err)
+	// 2. 请求 /mysql2 只能看到 mysql2_tool
+	_, resp2 := doPOST(t, ts.URL+"/mysql2", h1, b1)
+	var r2 struct {
+		Result ListToolsResult `json:"result"`
 	}
-
-	// 2. 缓冲区已满且无人消费，发送第 2 个包应在 50ms 超时熔断，不能永久挂死协程
-	start := time.Now()
-	err = sess.SendJSONRPCWithTimeout(2, "payload2", nil, 50*time.Millisecond)
-	elapsed := time.Since(start)
-
-	if err == nil {
-		t.Fatalf("second send on full buffer should fail with timeout error")
-	}
-	if !strings.Contains(err.Error(), "timeout") {
-		t.Errorf("expected timeout error message, got: %v", err)
-	}
-	if elapsed < 40*time.Millisecond || elapsed > 300*time.Millisecond {
-		t.Errorf("timeout should trigger around 50ms, elapsed: %v", elapsed)
+	_ = json.Unmarshal(resp2, &r2)
+	if len(r2.Result.Tools) != 1 || r2.Result.Tools[0].Name != "mysql2_tool" {
+		t.Errorf("unexpected tools on /mysql2: %+v", r2.Result.Tools)
 	}
 }

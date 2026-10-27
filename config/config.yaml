@@ -1,6 +1,8 @@
 server:
   port: 8080
   read_timeout_ms: 15000
+  allowed_origins: [] # 允许的 Origin 白名单。留空默认仅允许空 Origin (非浏览器) 与 localhost / 127.0.0.1
+  max_inflight_per_principal: 5 # 每个 endpoint 单个鉴权主体最大并发工具执行数 (超出返回 HTTP 429)
 
 # Casdoor OAuth 鉴权配置
 auth:
@@ -16,67 +18,76 @@ auth:
     - "openid"
     - "offline_access"
 
-# 只读数据源配置
-datasources:
+# 可命名的只读数据源。同一个种类可以声明多份，endpoint 按名字引用。
+# 再加一个 MySQL 就是在 sources.mysql 下加一段，然后给它一个自己的 endpoint。
+sources:
   mysql:
-    enabled: true
-    dsn: "${MYSQL_DSN:-root:password@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=True&loc=Local&multiStatements=false}"
-    max_open_conns: 20
-    max_idle_conns: 5
-    query_timeout_ms: 5000
-    security:
-      max_limit: 200
-      table_blacklist:
-        - "user_password"
-        - "auth_tokens"
-        - "sys_secret"
+    mysql-main:
+      dsn: "${MYSQL_DSN:-root:password@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=True&loc=Local&multiStatements=false}"
+      max_open_conns: 20
+      max_idle_conns: 5
+      query_timeout_ms: 5000
+      security:
+        max_limit: 200
+        table_blacklist:
+          - "user_password"
+          - "auth_tokens"
+          - "sys_secret"
 
   redis:
-    enabled: true
-    addr: "${REDIS_ADDR:-127.0.0.1:6379}"
-    password: "${REDIS_PASSWORD:-}"
-    allowed_dbs: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-    pool_size: 20
-    min_idle_conns: 5
-    max_items_limit: 200
-    query_timeout_ms: 3000
-    security:
-      allowed_commands:
-        - "GET"
-        - "MGET"
-        - "STRLEN"
-        - "GETRANGE"
-        - "HGET"
-        - "HMGET"
-        - "HGETALL"
-        - "HKEYS"
-        - "HVALS"
-        - "HLEN"
-        - "HEXISTS"
-        - "HSCAN"
-        - "LRANGE"
-        - "LINDEX"
-        - "LLEN"
-        - "SMEMBERS"
-        - "SISMEMBER"
-        - "SCARD"
-        - "SRANDMEMBER"
-        - "SSCAN"
-        - "ZRANGE"
-        - "ZREVRANGE"
-        - "ZRANGEBYSCORE"
-        - "ZCARD"
-        - "ZSCORE"
-        - "ZCOUNT"
-        - "ZSCAN"
-        - "SCAN"
-        - "TYPE"
-        - "TTL"
-        - "PTTL"
-        - "EXISTS"
-        - "PING"
-        - "DBSIZE"
-      blocked_commands:
-        - "KEYS"
-        - "MONITOR"
-        - "INFO"
+    redis-main:
+      addr: "${REDIS_ADDR:-127.0.0.1:6379}"
+      password: "${REDIS_PASSWORD:-}"
+      allowed_dbs: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+      pool_size: 20
+      min_idle_conns: 5
+      max_items_limit: 200
+      query_timeout_ms: 3000
+      security:
+        allowed_commands:
+          - "GET"
+          - "MGET"
+          - "STRLEN"
+          - "GETRANGE"
+          - "HGET"
+          - "HMGET"
+          - "HGETALL"
+          - "HKEYS"
+          - "HVALS"
+          - "HLEN"
+          - "HEXISTS"
+          - "HSCAN"
+          - "LRANGE"
+          - "LINDEX"
+          - "LLEN"
+          - "SMEMBERS"
+          - "SISMEMBER"
+          - "SCARD"
+          - "SRANDMEMBER"
+          - "SSCAN"
+          - "ZRANGE"
+          - "ZREVRANGE"
+          - "ZRANGEBYSCORE"
+          - "ZCARD"
+          - "ZSCORE"
+          - "ZCOUNT"
+          - "ZSCAN"
+          - "SCAN"
+          - "TYPE"
+          - "TTL"
+          - "PTTL"
+          - "EXISTS"
+          - "PING"
+          - "DBSIZE"
+        blocked_commands:
+          - "KEYS"
+          - "MONITOR"
+          - "INFO"
+
+# 每个 endpoint 是一个独立的 MCP 服务：POST /mysql 只看得到 mysql-main 的工具。
+# 两个 MySQL 数据源就写两个 endpoint，例如 /mysql1 引用 orders、/mysql2 引用 billing。
+endpoints:
+  - path: /mysql
+    sources: [mysql-main]
+  - path: /redis
+    sources: [redis-main]
