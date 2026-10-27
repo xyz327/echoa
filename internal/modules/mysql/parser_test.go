@@ -214,3 +214,60 @@ func TestValidateAndRewriteSQL(t *testing.T) {
 		t.Fatalf("expected error for subquery containing FOR UPDATE, got nil")
 	}
 }
+
+func TestValidateAndRewriteSQLWithSchema(t *testing.T) {
+	blacklist := []string{"vault.secret_tokens", "users_secret"}
+
+	// 1. 指定 defaultSchema，无前缀表名自动补充 schema 限定
+	sql1 := "SELECT id, name FROM users WHERE active = 1"
+	rewritten1, err := ValidateAndRewriteSQLWithSchema(sql1, "billing", 100, blacklist)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(rewritten1, "`billing`.`users`") {
+		t.Errorf("expected table qualified with `billing`.`users`, got: %s", rewritten1)
+	}
+	if !strings.HasSuffix(rewritten1, "LIMIT 100") {
+		t.Errorf("expected LIMIT 100 at end, got: %s", rewritten1)
+	}
+
+	// 2. 表名已有明确 schema 限定时，不被 defaultSchema 覆盖
+	sql2 := "SELECT id, name FROM orders.users WHERE active = 1"
+	rewritten2, err := ValidateAndRewriteSQLWithSchema(sql2, "billing", 100, blacklist)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(rewritten2, "`orders`.`users`") {
+		t.Errorf("expected original schema `orders`.`users` preserved, got: %s", rewritten2)
+	}
+
+	// 3. 带别名的表，别名不应被误加 schema 限定
+	sql3 := "SELECT u.id, u.name FROM users AS u WHERE u.id = 1"
+	rewritten3, err := ValidateAndRewriteSQLWithSchema(sql3, "crm", 100, blacklist)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(rewritten3, "`crm`.`users`") {
+		t.Errorf("table should be qualified with `crm`.`users`, got: %s", rewritten3)
+	}
+	if strings.Contains(rewritten3, "`crm`.`u`") {
+		t.Errorf("alias 'u' must not be qualified with schema, got: %s", rewritten3)
+	}
+
+	// 4. SHOW TABLES 传入 defaultSchema 自动改写为 SHOW TABLES FROM/IN <defaultSchema>
+	sql4 := "SHOW TABLES"
+	rewritten4, err := ValidateAndRewriteSQLWithSchema(sql4, "analytics", 100, blacklist)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(rewritten4, "SHOW TABLES IN `analytics`") && !strings.Contains(rewritten4, "SHOW TABLES FROM `analytics`") {
+		t.Errorf("expected SHOW TABLES IN/FROM `analytics`, got: %s", rewritten4)
+	}
+
+	// 5. 命中 schema.table 组合黑名单
+	sql5 := "SELECT * FROM secret_tokens"
+	_, err = ValidateAndRewriteSQLWithSchema(sql5, "vault", 100, blacklist)
+	if err == nil {
+		t.Fatalf("expected error for blacklisted vault.secret_tokens, got nil")
+	}
+}

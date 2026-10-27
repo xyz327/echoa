@@ -84,28 +84,55 @@ func registerTools(registry *mcp.ToolRegistry, name string, m *Module, qualify b
 		prefix = name + "_mysql"
 	}
 
-	// 1. 注册 mysql_list_tables
+	// 1. 注册 mysql_list_databases
+	registry.Register(&mcp.ToolDefinition{
+		Name: prefix + "_list_databases",
+		Description: "List all accessible databases/schemas in the MySQL instance. " +
+			"Returns database names, charset, collation, and current database. Source: " + name + ".",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"pattern": map[string]any{
+					"type":        "string",
+					"description": "Optional SQL LIKE pattern to filter database names (e.g. 'order_%')",
+				},
+			},
+		},
+		Handler: m.HandleListDatabases,
+	})
+
+	// 2. 注册 mysql_list_tables
 	registry.Register(&mcp.ToolDefinition{
 		Name: prefix + "_list_tables",
-		Description: "List all accessible tables in the current MySQL database with row estimates and metadata. " +
-			"Filtered against table blacklist. Source: " + name + ".",
+		Description: "List accessible tables with row estimates and metadata. " +
+			"Filtered against table blacklist. Supports querying a specific schema or listing across databases. Source: " + name + ".",
 		InputSchema: map[string]any{
-			"type":       "object",
-			"properties": map[string]any{},
+			"type": "object",
+			"properties": map[string]any{
+				"schema": map[string]any{
+					"type":        "string",
+					"description": "Optional database/schema name to list tables from. If omitted, uses current database or lists across accessible user databases.",
+				},
+			},
 		},
 		Handler: m.HandleListTables,
 	})
 
-	// 2. 注册 mysql_describe_table
+	// 3. 注册 mysql_describe_table
 	registry.Register(&mcp.ToolDefinition{
-		Name:        prefix + "_describe_table",
-		Description: "Get column names, types, nullability, keys, default values, and comments for a specified MySQL table. Source: " + name + ".",
+		Name: prefix + "_describe_table",
+		Description: "Get column names, types, nullability, keys, default values, and comments for a specified MySQL table. " +
+			"Supports 'table' or 'schema.table' (e.g. 'users' or 'billing.orders'). Source: " + name + ".",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"table_name": map[string]any{
 					"type":        "string",
-					"description": "Name of the table to describe",
+					"description": "Name of the table to describe. Supports 'table' or 'schema.table' (e.g. 'users' or 'billing.orders')",
+				},
+				"schema": map[string]any{
+					"type":        "string",
+					"description": "Optional database/schema name. If table_name contains a dot, this parameter is ignored.",
 				},
 			},
 			"required": []string{"table_name"},
@@ -113,17 +140,22 @@ func registerTools(registry *mcp.ToolRegistry, name string, m *Module, qualify b
 		Handler: m.HandleDescribeTable,
 	})
 
-	// 3. 注册 mysql_query
+	// 4. 注册 mysql_query
 	registry.Register(&mcp.ToolDefinition{
 		Name: prefix + "_query",
 		Description: "Execute a read-only MySQL SQL query (SELECT, EXPLAIN, SHOW). " +
-			"Enforces strict AST verification, table blacklist checks, and automatic LIMIT capping. Source: " + name + ".",
+			"Enforces strict AST verification, table blacklist checks, and automatic LIMIT capping. " +
+			"Supports cross-database queries (e.g. SELECT * FROM other_db.table) and optional default schema. Source: " + name + ".",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"query": map[string]any{
 					"type":        "string",
-					"description": "SQL statement to execute (e.g. SELECT * FROM users WHERE status = 1)",
+					"description": "SQL statement to execute (e.g. SELECT * FROM users, or cross-db: SELECT * FROM other_db.orders)",
+				},
+				"schema": map[string]any{
+					"type":        "string",
+					"description": "Optional default database/schema name for unqualified table names in the query",
 				},
 				"max_rows": map[string]any{
 					"type":        "integer",

@@ -73,15 +73,35 @@
 
 ### 1. MySQL 工具
 
+#### `mysql_list_databases`
+列出当前 MySQL 实例中所有可访问的业务数据库（schema），自动过滤内部系统库（`information_schema`、`mysql`、`performance_schema`、`sys`）。
+- **参数**：
+  - `pattern` (`string`, 可选): 可选的 SQL LIKE 过滤模式（如 `"order_%"`、`"%test%"`）。
+- **返回示例**：
+  ```json
+  {
+    "total_databases": 2,
+    "databases": [
+      { "name": "billing", "charset": "utf8mb4", "collation": "utf8mb4_unicode_ci" },
+      { "name": "orders", "charset": "utf8mb4", "collation": "utf8mb4_unicode_ci" }
+    ],
+    "current_database": "orders"
+  }
+  ```
+
 #### `mysql_list_tables`
-列出当前数据库的所有可用表、类型、存储引擎、预估行数及表注释（自动过滤配置黑名单中的敏感表）。
-- **参数**：无
+列出指定或当前数据库的所有可用表、类型、存储引擎、预估行数及表注释（自动过滤配置黑名单中的敏感表）。
+- **参数**：
+  - `schema` (`string`, 可选): 待查的目标数据库/schema 名称。
+    - **指定时**：查询该数据库下的所有数据表。
+    - **未指定时**：若连接已配置默认数据库，查询默认库中的表；若连接未配置默认库（如 DSN 仅连到根路径 `/`），自动列出全部业务库中的表并在结果中标明所属 `schema`。
 - **返回示例**：
   ```json
   {
     "total_tables": 2,
     "tables": [
       {
+        "schema": "orders",
         "name": "orders",
         "type": "BASE TABLE",
         "engine": "InnoDB",
@@ -89,6 +109,7 @@
         "comment": "业务订单表"
       },
       {
+        "schema": "orders",
         "name": "users",
         "type": "BASE TABLE",
         "engine": "InnoDB",
@@ -102,15 +123,17 @@
 #### `mysql_describe_table`
 查看指定表的结构定义，包含字段名、类型、是否允许 NULL、主键/索引键、默认值、额外属性及字段注释。
 - **参数**：
-  - `table_name` (`string`, 必填): 目标表名，支持 `users` 或 `test.users`。黑名单内的表会被直接拒绝。
+  - `table_name` (`string`, 必填): 目标表名。支持普通表名 `users` 或跨库表名 `schema.table`（如 `billing.orders`）。
+  - `schema` (`string`, 可选): 目标数据库/schema 名称。当 `table_name` 已经包含 `.` 时本参数被忽略。若两者均未提供，回退到连接默认库。
 - **返回示例**：
   ```json
   {
-    "table": "users",
+    "schema": "billing",
+    "table": "orders",
     "columns": [
       { "field": "id", "type": "bigint", "null": "NO", "key": "PRI", "default": "", "extra": "auto_increment", "comment": "" },
-      { "field": "username", "type": "varchar(64)", "null": "NO", "key": "UNI", "default": "", "extra": "", "comment": "用户账号" },
-      { "field": "email", "type": "varchar(128)", "null": "NO", "key": "", "default": "", "extra": "", "comment": "邮箱" }
+      { "field": "order_no", "type": "varchar(64)", "null": "NO", "key": "UNI", "default": "", "extra": "", "comment": "订单号" },
+      { "field": "amount", "type": "decimal(10,2)", "null": "NO", "key": "", "default": "0.00", "extra": "", "comment": "订单金额" }
     ]
   }
   ```
@@ -118,7 +141,8 @@
 #### `mysql_query`
 执行只读 SQL 查询。服务端进行 TiDB AST 审查，仅允许 `SELECT`、`EXPLAIN`、`SHOW`，并自动追加或改写 `LIMIT`。
 - **参数**：
-  - `query` (`string`, 必填): 待执行的 SQL 语句，例如 `SELECT id, username, email FROM users WHERE active = 1`。
+  - `query` (`string`, 必填): 待执行的 SQL 语句。支持同一实例下的跨库查询（例如 `SELECT * FROM billing.orders JOIN crm.users ON ...`）。
+  - `schema` (`string`, 可选): 可选的默认数据库/schema 名称。若传入，服务端会在 AST 解析阶段自动为未带前缀的数据表补充限定（例如把 `SELECT * FROM orders` 自动补全为 `SELECT * FROM billing.orders`），**杜绝在连接池复用环境下调用 `USE db` 引发的连接污染隐患**。
   - `max_rows` (`integer`, 可选): 本次查询希望返回的行数上限（不能超过服务端配置的 `max_limit`）。
 - **返回示例**：
   ```json
@@ -511,6 +535,7 @@ https://echoa.example.com/mysql
       "url": "https://echoa.example.com/mysql",
       "disabled": false,
       "autoApprove": [
+        "mysql_list_databases",
         "mysql_list_tables",
         "mysql_describe_table",
         "redis_scan_keys",

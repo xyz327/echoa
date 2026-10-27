@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -11,25 +12,112 @@ import (
 	"github.com/casdoor/casdoor-go-sdk/casdoorsdk"
 )
 
+// HandleListDatabases 对应工具 mysql_list_databases，列出当前 MySQL 实例上的所有可用业务数据库/schema
+func (m *Module) HandleListDatabases(ctx context.Context, claims *casdoorsdk.Claims, args map[string]any) (string, error) {
+	queryCtx, cancel := context.WithTimeout(ctx, time.Duration(m.cfg.QueryTimeoutMS)*time.Millisecond)
+	defer cancel()
+
+	pattern, _ := args["pattern"].(string)
+	pattern = strings.TrimSpace(pattern)
+
+	var sqlStr string
+	var queryArgs []any
+
+	if pattern != "" {
+		sqlStr = `
+			SELECT schema_name, default_character_set_name, default_collation_name
+			FROM information_schema.schemata
+			WHERE schema_name NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+			  AND schema_name LIKE ?
+			ORDER BY schema_name
+		`
+		queryArgs = append(queryArgs, pattern)
+	} else {
+		sqlStr = `
+			SELECT schema_name, default_character_set_name, default_collation_name
+			FROM information_schema.schemata
+			WHERE schema_name NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+			ORDER BY schema_name
+		`
+	}
+
+	rows, err := m.db.QueryContext(queryCtx, sqlStr, queryArgs...)
+	if err != nil {
+		return "", fmt.Errorf("failed to query databases: %w", err)
+	}
+	defer rows.Close()
+
+	type DatabaseMeta struct {
+		Name      string `json:"name"`
+		Charset   string `json:"charset,omitempty"`
+		Collation string `json:"collation,omitempty"`
+	}
+
+	var dbs []DatabaseMeta
+	for rows.Next() {
+		var dbMeta DatabaseMeta
+		if err := rows.Scan(&dbMeta.Name, &dbMeta.Charset, &dbMeta.Collation); err != nil {
+			return "", err
+		}
+		dbs = append(dbs, dbMeta)
+	}
+
+	// 获取当前连接默认 schema (若 DSN 未包含则为空)
+	var currentDB sql.NullString
+	_ = m.db.QueryRowContext(queryCtx, "SELECT DATABASE()").Scan(&currentDB)
+
+	res, err := json.MarshalIndent(map[string]any{
+		"total_databases":  len(dbs),
+		"databases":        dbs,
+		"current_database": currentDB.String,
+	}, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(res), nil
+}
+
 // HandleListTables 对应工具 mysql_list_tables
 func (m *Module) HandleListTables(ctx context.Context, claims *casdoorsdk.Claims, args map[string]any) (string, error) {
 	queryCtx, cancel := context.WithTimeout(ctx, time.Duration(m.cfg.QueryTimeoutMS)*time.Millisecond)
 	defer cancel()
 
-	sqlStr := `
-		SELECT table_name, table_type, IFNULL(engine, ''), IFNULL(table_rows, 0), IFNULL(table_comment, '')
-		FROM information_schema.tables
-		WHERE table_schema = DATABASE()
-		ORDER BY table_name
-	`
+	schema, _ := args["schema"].(string)
+	schema = strings.TrimSpace(strings.Trim(schema, "`"))
 
-	rows, err := m.db.QueryContext(queryCtx, sqlStr)
+	var sqlStr string
+	var queryArgs []any
+
+	if schema != "" {
+		sqlStr = `
+			SELECT table_schema, table_name, table_type, IFNULL(engine, ''), IFNULL(table_rows, 0), IFNULL(table_comment, '')
+			FROM information_schema.tables
+			WHERE table_schema = ?
+			ORDER BY table_name
+		`
+		queryArgs = append(queryArgs, schema)
+	} else {
+		// 未指定 schema 时：优先取连接默认库；若连接无默认库，则查询所有业务库
+		sqlStr = `
+			SELECT table_schema, table_name, table_type, IFNULL(engine, ''), IFNULL(table_rows, 0), IFNULL(table_comment, '')
+			FROM information_schema.tables
+			WHERE (
+				(DATABASE() IS NOT NULL AND DATABASE() != '' AND table_schema = DATABASE())
+				OR
+				((DATABASE() IS NULL OR DATABASE() = '') AND table_schema NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys'))
+			)
+			ORDER BY table_schema, table_name
+		`
+	}
+
+	rows, err := m.db.QueryContext(queryCtx, sqlStr, queryArgs...)
 	if err != nil {
 		return "", fmt.Errorf("failed to query table schema: %w", err)
 	}
 	defer rows.Close()
 
 	type TableMeta struct {
+		Schema       string `json:"schema,omitempty"`
 		Name         string `json:"name"`
 		Type         string `json:"type"`
 		Engine       string `json:"engine,omitempty"`
@@ -40,11 +128,11 @@ func (m *Module) HandleListTables(ctx context.Context, claims *casdoorsdk.Claims
 	var tables []TableMeta
 	for rows.Next() {
 		var t TableMeta
-		if err := rows.Scan(&t.Name, &t.Type, &t.Engine, &t.RowsEstimate, &t.Comment); err != nil {
+		if err := rows.Scan(&t.Schema, &t.Name, &t.Type, &t.Engine, &t.RowsEstimate, &t.Comment); err != nil {
 			return "", err
 		}
 		// 过滤黑名单表（支持 bare table 或 schema.table）
-		if IsTableBlacklisted("", t.Name, m.cfg.Security.TableBlacklist) {
+		if IsTableBlacklisted(t.Schema, t.Name, m.cfg.Security.TableBlacklist) {
 			continue
 		}
 		tables = append(tables, t)
@@ -68,28 +156,50 @@ func (m *Module) HandleDescribeTable(ctx context.Context, claims *casdoorsdk.Cla
 		return "", fmt.Errorf("missing required parameter 'table_name'")
 	}
 
-	// 校验表是否属于黑名单（支持 bare table 与 schema.table）
-	schema := ""
-	table := tableName
+	targetSchema := ""
+	targetTable := tableName
+
+	// 支持 "schema.table" 传参格式
 	if parts := strings.Split(tableName, "."); len(parts) == 2 {
-		schema = parts[0]
-		table = parts[1]
+		targetSchema = strings.TrimSpace(parts[0])
+		targetTable = strings.TrimSpace(parts[1])
+	} else if customSchema, _ := args["schema"].(string); strings.TrimSpace(customSchema) != "" {
+		targetSchema = strings.TrimSpace(customSchema)
 	}
-	if IsTableBlacklisted(schema, table, m.cfg.Security.TableBlacklist) {
+
+	targetSchema = strings.Trim(targetSchema, "`")
+	targetTable = strings.Trim(targetTable, "`")
+
+	// 校验表是否属于黑名单（支持 bare table 与 schema.table）
+	if IsTableBlacklisted(targetSchema, targetTable, m.cfg.Security.TableBlacklist) {
 		return "", fmt.Errorf("access to table '%s' is prohibited by security policy", tableName)
 	}
 
 	queryCtx, cancel := context.WithTimeout(ctx, time.Duration(m.cfg.QueryTimeoutMS)*time.Millisecond)
 	defer cancel()
 
-	sqlStr := `
-		SELECT column_name, column_type, is_nullable, column_key, IFNULL(column_default, ''), extra, column_comment
-		FROM information_schema.columns
-		WHERE table_schema = DATABASE() AND table_name = ?
-		ORDER BY ordinal_position
-	`
+	var sqlStr string
+	var queryArgs []any
 
-	rows, err := m.db.QueryContext(queryCtx, sqlStr, tableName)
+	if targetSchema != "" {
+		sqlStr = `
+			SELECT column_name, column_type, is_nullable, column_key, IFNULL(column_default, ''), extra, column_comment
+			FROM information_schema.columns
+			WHERE table_schema = ? AND table_name = ?
+			ORDER BY ordinal_position
+		`
+		queryArgs = []any{targetSchema, targetTable}
+	} else {
+		sqlStr = `
+			SELECT column_name, column_type, is_nullable, column_key, IFNULL(column_default, ''), extra, column_comment
+			FROM information_schema.columns
+			WHERE table_schema = DATABASE() AND table_name = ?
+			ORDER BY ordinal_position
+		`
+		queryArgs = []any{targetTable}
+	}
+
+	rows, err := m.db.QueryContext(queryCtx, sqlStr, queryArgs...)
 	if err != nil {
 		return "", fmt.Errorf("failed to describe table '%s': %w", tableName, err)
 	}
@@ -115,13 +225,21 @@ func (m *Module) HandleDescribeTable(ctx context.Context, claims *casdoorsdk.Cla
 	}
 
 	if len(columns) == 0 {
-		return "", fmt.Errorf("table '%s' does not exist or has no columns", tableName)
+		if targetSchema != "" {
+			return "", fmt.Errorf("table '%s.%s' does not exist or has no columns", targetSchema, targetTable)
+		}
+		return "", fmt.Errorf("table '%s' does not exist in current database (or no default database selected, please specify 'schema')", targetTable)
 	}
 
-	res, err := json.MarshalIndent(map[string]any{
-		"table":   tableName,
+	output := map[string]any{
+		"table":   targetTable,
 		"columns": columns,
-	}, "", "  ")
+	}
+	if targetSchema != "" {
+		output["schema"] = targetSchema
+	}
+
+	res, err := json.MarshalIndent(output, "", "  ")
 	if err != nil {
 		return "", err
 	}
@@ -135,6 +253,9 @@ func (m *Module) HandleQuery(ctx context.Context, claims *casdoorsdk.Claims, arg
 		return "", fmt.Errorf("missing required parameter 'query'")
 	}
 
+	customSchema, _ := args["schema"].(string)
+	customSchema = strings.TrimSpace(customSchema)
+
 	maxLimit := m.cfg.Security.MaxLimit
 	if customLimit, ok := args["max_rows"]; ok {
 		if limitInt, ok := toInt(customLimit); ok && limitInt > 0 && limitInt < maxLimit {
@@ -142,8 +263,8 @@ func (m *Module) HandleQuery(ctx context.Context, claims *casdoorsdk.Claims, arg
 		}
 	}
 
-	// 1. AST 语法强校验与强制 LIMIT 改写
-	safeSQL, err := ValidateAndRewriteSQL(query, maxLimit, m.cfg.Security.TableBlacklist)
+	// 1. AST 语法强校验、可选 schema 补充与强制 LIMIT 改写
+	safeSQL, err := ValidateAndRewriteSQLWithSchema(query, customSchema, maxLimit, m.cfg.Security.TableBlacklist)
 	if err != nil {
 		return "", fmt.Errorf("security check failed: %w", err)
 	}

@@ -54,6 +54,25 @@ func (v *safetyVisitor) Leave(in ast.Node) (ast.Node, bool) {
 	return in, true
 }
 
+type schemaQualifierVisitor struct {
+	defaultSchema string
+}
+
+func (v *schemaQualifierVisitor) Enter(in ast.Node) (ast.Node, bool) {
+	if v.defaultSchema != "" {
+		if t, ok := in.(*ast.TableName); ok {
+			if t.Schema.L == "" && !t.IsAlias {
+				t.Schema = ast.NewCIStr(v.defaultSchema)
+			}
+		}
+	}
+	return in, false
+}
+
+func (v *schemaQualifierVisitor) Leave(in ast.Node) (ast.Node, bool) {
+	return in, true
+}
+
 // IsTableBlacklisted 判断指定表（及可选库名）是否命中黑名单
 // 支持 "table"（匹配任意库下的该表）与 "schema.table"（精准匹配特定库下的该表），支持自动去除反引号
 func IsTableBlacklisted(schema, table string, blacklist []string) bool {
@@ -86,12 +105,18 @@ func IsTableBlacklisted(schema, table string, blacklist []string) bool {
 	return false
 }
 
-// ValidateAndRewriteSQL 校验 SQL 语句并注入/改写 LIMIT
+// ValidateAndRewriteSQL 校验 SQL 语句并注入/改写 LIMIT（保持无默认 schema 兼容）
 func ValidateAndRewriteSQL(sqlStr string, maxLimit int, blacklist []string) (string, error) {
+	return ValidateAndRewriteSQLWithSchema(sqlStr, "", maxLimit, blacklist)
+}
+
+// ValidateAndRewriteSQLWithSchema 校验 SQL 语句，若传入 defaultSchema，自动为无前缀的数据表补充 schema 限定
+func ValidateAndRewriteSQLWithSchema(sqlStr string, defaultSchema string, maxLimit int, blacklist []string) (string, error) {
 	trimmed := strings.TrimSpace(sqlStr)
 	// 去除末尾分号
 	trimmed = strings.TrimRight(trimmed, ";")
 	trimmed = strings.TrimSpace(trimmed)
+	defaultSchema = strings.TrimSpace(strings.Trim(defaultSchema, "`"))
 
 	p := parser.New()
 	stmts, _, err := p.Parse(trimmed, "", "")
@@ -129,12 +154,21 @@ func ValidateAndRewriteSQL(sqlStr string, maxLimit int, blacklist []string) (str
 	case *ast.ExplainStmt:
 		// EXPLAIN 允许通过
 	case *ast.ShowStmt:
-		// SHOW 允许通过
+		// SHOW 允许通过；若指定了 defaultSchema 且为 SHOW TABLES，为其补充 FROM <defaultSchema>
+		if defaultSchema != "" && s.Tp == ast.ShowTables && s.DBName == "" {
+			s.DBName = defaultSchema
+		}
 	default:
 		return "", fmt.Errorf("only read-only statements (SELECT, EXPLAIN, SHOW) are allowed, got: %T", s)
 	}
 
-	// 1. 检查表黑名单 (支持 'table' 与 'schema.table')
+	// 1. 若指定了 defaultSchema，自动为无 schema 前缀的数据表补充限定
+	if defaultSchema != "" {
+		qv := &schemaQualifierVisitor{defaultSchema: defaultSchema}
+		stmt.Accept(qv)
+	}
+
+	// 2. 检查表黑名单 (支持 'table' 与 'schema.table')
 	if len(blacklist) > 0 {
 		v := &tableVisitor{}
 		stmt.Accept(v)
@@ -150,8 +184,8 @@ func ValidateAndRewriteSQL(sqlStr string, maxLimit int, blacklist []string) (str
 		}
 	}
 
-	// 2. 对于 SELECT / UNION 类查询，通过 AST Restore 还原注入/改写后的安全 SQL
-	if isQuery {
+	// 3. 对于 SELECT / UNION / SHOW 类或发生改写的查询，通过 AST Restore 还原注入/改写后的安全 SQL
+	if isQuery || defaultSchema != "" {
 		var sb strings.Builder
 		restoreCtx := format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)
 		if err := stmt.Restore(restoreCtx); err != nil {
