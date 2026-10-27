@@ -378,20 +378,29 @@ docker run --rm -d -p 8080:8080 \
 
 ## 客户端接入配置
 
+推荐使用 **OAuth 自动认证**：配置中只写服务 URL，不要预置 `Authorization`。客户端访问时收到 HTTP 401，从 `WWW-Authenticate` 中的 `resource_metadata` 发现 Casdoor，再打开浏览器完成登录。手工 Bearer Token 仅用于调试、自动化脚本，或不支持 OAuth 发现的客户端。
+
+自动认证要求 `auth.enabled: true`，且 `auth.resource_url` 必须是客户端实际访问的 HTTPS 地址。Casdoor 需要提供 OAuth 2.1 Authorization Code + PKCE，并建议支持 Dynamic Client Registration；否则客户端可能要求手工填写 Client ID。
+
 ### 1. Claude Desktop
 
-在配置文件（macOS 位于 `~/Library/Application Support/Claude/claude_desktop_config.json`，Windows 位于 `%APPDATA%\Claude\claude_desktop_config.json`）中添加：
+在 **Settings → Connectors → Add custom connector** 中只填写：
 
-#### 生产模式（开启 Casdoor OAuth / JWT）
+```text
+https://echoa.example.com/sse
+```
+
+保存后点击 **Connect**，Claude Desktop 会打开浏览器完成 Casdoor 登录，并自动保存和刷新 Token。不要在连接器中填写 Bearer Token。
+
+如果使用配置文件（macOS 位于 `~/Library/Application Support/Claude/claude_desktop_config.json`，Windows 位于 `%APPDATA%\Claude\claude_desktop_config.json`），同样只写 URL：
+
+#### OAuth 自动认证（推荐）
 ```json
 {
   "mcpServers": {
     "echoa": {
       "type": "sse",
-      "url": "http://127.0.0.1:8080/sse",
-      "headers": {
-        "Authorization": "Bearer <YOUR_CASDOOR_JWT_TOKEN>"
-      }
+      "url": "https://echoa.example.com/sse"
     }
   }
 }
@@ -411,25 +420,23 @@ docker run --rm -d -p 8080:8080 \
 
 ### 2. Cursor
 
-进入 **Settings -> Features -> MCP Servers -> Add new MCP server**：
+进入 **Settings → Features → MCP Servers → Add new MCP server**：
+
 - **Name**: `echoa`
 - **Type**: `SSE`
-- **URL**: `http://127.0.0.1:8080/sse`
-- 若开启鉴权，在 Headers 中添加：
-  - Key: `Authorization`
-  - Value: `Bearer <YOUR_CASDOOR_JWT_TOKEN>`
+- **URL**: `https://echoa.example.com/sse`
 
-### 3. Cline / Roo Code (VS Code 插件)
+保存后 Cursor 会根据 401 挑战启动浏览器登录。Headers 留空；预置 `Authorization` 会让 Cursor 跳过自动登录流程。
 
-编辑 `cline_mcp_settings.json`：
+### 3. Cline / Roo Code（VS Code 插件）
+
+编辑 `cline_mcp_settings.json`，不要添加 `headers`：
+
 ```json
 {
   "mcpServers": {
     "echoa": {
-      "url": "http://127.0.0.1:8080/sse",
-      "headers": {
-        "Authorization": "Bearer <YOUR_CASDOOR_JWT_TOKEN>"
-      },
+      "url": "https://echoa.example.com/sse",
       "disabled": false,
       "autoApprove": [
         "mysql_list_tables",
@@ -441,6 +448,28 @@ docker run --rm -d -p 8080:8080 \
   }
 }
 ```
+
+保存后在插件的 MCP 列表中点击连接，按提示完成 Casdoor 登录。
+
+### 手工 Bearer Token（不推荐）
+
+仅当客户端不支持 OAuth 发现，或需要在脚本中使用固定凭证时才使用：
+
+```json
+{
+  "mcpServers": {
+    "echoa": {
+      "type": "sse",
+      "url": "https://echoa.example.com/sse",
+      "headers": {
+        "Authorization": "Bearer <YOUR_CASDOOR_JWT_TOKEN>"
+      }
+    }
+  }
+}
+```
+
+Token 过期后需要手工替换。URL Query 中的 `token` 或 `access_token` 仅作为老旧客户端兼容，服务端会记录安全告警，不要用于新配置。
 
 ---
 
