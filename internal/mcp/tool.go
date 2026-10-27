@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/casdoor/casdoor-go-sdk/casdoorsdk"
@@ -39,6 +40,9 @@ func (r *ToolRegistry) ListTools() []*ToolDefinition {
 	for _, t := range r.tools {
 		list = append(list, t)
 	}
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].Name < list[j].Name
+	})
 	return list
 }
 
