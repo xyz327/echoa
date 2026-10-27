@@ -42,10 +42,11 @@
    - 严格遵循 RFC 6750，通过 `Authorization: Bearer <jwt>` 标头进行无状态验签。
    - 兼容老旧客户端通过 URL Query（`?token=...` / `?access_token=...`）传参的模式（已标记为 Deprecated 并记录安全告警）。
    - 实现 RFC 9728 规范的 Protected Resource Metadata (`/.well-known/oauth-protected-resource`)，支持客户端自动发现认证服务器与 Scope。
-3. **MySQL 深度 AST 防御体系**：
+3. **MySQL 深度 AST 防御体系与可选 Schema**：
    - 基于 `pingcap/tidb/pkg/parser` 对传入 SQL 做抽象语法树（AST）强校验，仅允许 `SELECT`、`EXPLAIN`、`SHOW`。
    - 彻底拦截 `SELECT ... FOR UPDATE`、`LOCK IN SHARE MODE` 等加锁读取，以及 `SELECT ... INTO OUTFILE / DUMPFILE` 等服务端写盘提权语句。
    - 智能 LIMIT 注入与改写：无 LIMIT 自动追加系统上限；超过配置上限强制压低改写；保留原分页 offset；子查询与外层查询严格隔离改写。
+   - 跨库支持与可选 Schema：DSN 允许省略默认数据库（非强制绑定），提供 `mysql_list_databases` 数据库发现；`mysql_list_tables` / `mysql_describe_table` 支持参数指定 schema 或 `schema.table` 格式；`mysql_query` 在 AST 层自动补全 schema 限定，**杜绝并发调用 `USE db` 导致连接池污染**。
    - 敏感数据表黑名单过滤（支持 `table` 与 `schema.table` 精准匹配拦截）。
    - 双重防撑爆防护：单单元格 4KB 缩略截断 + 结果集 64KB 字符级硬上限。
 4. **Redis 6 ACL 鉴权与多 DB 独立隔离治理**：
@@ -69,7 +70,7 @@
 
 ## MCP 工具清单与参数定义
 
-每个 endpoint 向 MCP 客户端暴露它引用的 source 对应的工具。一个 endpoint 只挂一个 MySQL 时是下面这 3 个；Redis 同理。
+每个 endpoint 向 MCP 客户端暴露它引用的 source 对应的工具。一个 endpoint 只挂一个 MySQL 时是下面这 4 个；Redis 同理。
 
 ### 1. MySQL 工具
 
