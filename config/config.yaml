@@ -30,7 +30,8 @@ sources:
       max_idle_conns: 5
       query_timeout_ms: 5000
       security:
-        max_limit: 200
+        max_limit: 200            # 单次查询强制限制的最大返回行数
+        max_offset: 100000        # 分页 OFFSET 上限，超出直接拒绝（防深分页全表扫描）
         table_blacklist:
           - "user_password"
           - "auth_tokens"

@@ -220,7 +220,7 @@ func TestValidateAndRewriteSQLWithSchema(t *testing.T) {
 
 	// 1. 指定 defaultSchema，无前缀表名自动补充 schema 限定
 	sql1 := "SELECT id, name FROM users WHERE active = 1"
-	rewritten1, err := ValidateAndRewriteSQLWithSchema(sql1, "billing", 100, blacklist)
+	rewritten1, err := ValidateAndRewriteSQLWithSchema(sql1, "billing", 100, DefaultMaxQueryOffset, blacklist)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestValidateAndRewriteSQLWithSchema(t *testing.T) {
 
 	// 2. 表名已有明确 schema 限定时，不被 defaultSchema 覆盖
 	sql2 := "SELECT id, name FROM orders.users WHERE active = 1"
-	rewritten2, err := ValidateAndRewriteSQLWithSchema(sql2, "billing", 100, blacklist)
+	rewritten2, err := ValidateAndRewriteSQLWithSchema(sql2, "billing", 100, DefaultMaxQueryOffset, blacklist)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestValidateAndRewriteSQLWithSchema(t *testing.T) {
 
 	// 3. 带别名的表，别名不应被误加 schema 限定
 	sql3 := "SELECT u.id, u.name FROM users AS u WHERE u.id = 1"
-	rewritten3, err := ValidateAndRewriteSQLWithSchema(sql3, "crm", 100, blacklist)
+	rewritten3, err := ValidateAndRewriteSQLWithSchema(sql3, "crm", 100, DefaultMaxQueryOffset, blacklist)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestValidateAndRewriteSQLWithSchema(t *testing.T) {
 
 	// 4. SHOW TABLES 传入 defaultSchema 自动改写为 SHOW TABLES FROM/IN <defaultSchema>
 	sql4 := "SHOW TABLES"
-	rewritten4, err := ValidateAndRewriteSQLWithSchema(sql4, "analytics", 100, blacklist)
+	rewritten4, err := ValidateAndRewriteSQLWithSchema(sql4, "analytics", 100, DefaultMaxQueryOffset, blacklist)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -266,8 +266,86 @@ func TestValidateAndRewriteSQLWithSchema(t *testing.T) {
 
 	// 5. 命中 schema.table 组合黑名单
 	sql5 := "SELECT * FROM secret_tokens"
-	_, err = ValidateAndRewriteSQLWithSchema(sql5, "vault", 100, blacklist)
+	_, err = ValidateAndRewriteSQLWithSchema(sql5, "vault", 100, DefaultMaxQueryOffset, blacklist)
 	if err == nil {
 		t.Fatalf("expected error for blacklisted vault.secret_tokens, got nil")
+	}
+}
+
+func TestExplainAnalyzeAndOffsetLimits(t *testing.T) {
+	blacklist := []string{"secret_tokens"}
+
+	// 1. EXPLAIN ANALYZE 会真正执行内层语句，必须和普通 SELECT 一样注入 LIMIT
+	rewritten, err := ValidateAndRewriteSQL("EXPLAIN ANALYZE SELECT * FROM users", 100, blacklist)
+	if err != nil {
+		t.Fatalf("unexpected error for EXPLAIN ANALYZE: %v", err)
+	}
+	if !strings.Contains(strings.ToUpper(rewritten), "EXPLAIN ANALYZE") {
+		t.Errorf("EXPLAIN ANALYZE should be preserved, got: %s", rewritten)
+	}
+	if !strings.HasSuffix(rewritten, "LIMIT 100") {
+		t.Errorf("EXPLAIN ANALYZE inner query should get LIMIT 100, got: %s", rewritten)
+	}
+
+	// 2. EXPLAIN ANALYZE 内已有的超大 LIMIT 同样要压低
+	rewritten, err = ValidateAndRewriteSQL("EXPLAIN ANALYZE SELECT * FROM users LIMIT 5000", 100, blacklist)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.HasSuffix(rewritten, "LIMIT 100") {
+		t.Errorf("EXPLAIN ANALYZE LIMIT should be capped to 100, got: %s", rewritten)
+	}
+
+	// 3. EXPLAIN ANALYZE 不能绕过表黑名单
+	if _, err = ValidateAndRewriteSQL("EXPLAIN ANALYZE SELECT * FROM secret_tokens", 100, blacklist); err == nil {
+		t.Fatalf("expected blacklist rejection inside EXPLAIN ANALYZE, got nil")
+	}
+
+	// 3b. EXPLAIN 语法也接受 DML，只读模式必须拒绝
+	for _, sql := range []string{
+		"EXPLAIN ANALYZE DELETE FROM users",
+		"EXPLAIN UPDATE users SET name = 'x'",
+		"EXPLAIN INSERT INTO users (id) VALUES (1)",
+	} {
+		if _, err = ValidateAndRewriteSQL(sql, 100, blacklist); err == nil {
+			t.Fatalf("expected rejection for %q, got nil", sql)
+		}
+	}
+
+	// 4. 普通 EXPLAIN 只读执行计划，保持原样
+	plain := "EXPLAIN SELECT * FROM users"
+	if rewritten, err = ValidateAndRewriteSQL(plain, 100, blacklist); err != nil {
+		t.Fatalf("unexpected error for EXPLAIN: %v", err)
+	}
+	if rewritten != plain {
+		t.Errorf("plain EXPLAIN should be returned unmodified, got: %s", rewritten)
+	}
+
+	// 5. 超大 OFFSET 必须拒绝：返回行数受 max_limit 约束，但前面所有行都要先被扫过
+	_, err = ValidateAndRewriteSQL("SELECT id FROM users LIMIT 100000000, 10", 100, blacklist)
+	if err == nil {
+		t.Fatalf("expected error for excessive LIMIT offset, got nil")
+	}
+	if !strings.Contains(err.Error(), "maximum allowed offset") {
+		t.Errorf("expected offset error, got: %v", err)
+	}
+
+	// 6. 限额内的分页 offset 原样保留
+	rewritten, err = ValidateAndRewriteSQL("SELECT id FROM users LIMIT 500, 10", 100, blacklist)
+	if err != nil {
+		t.Fatalf("unexpected error for paginated query: %v", err)
+	}
+	if !strings.Contains(rewritten, "500") {
+		t.Errorf("offset 500 should be preserved, got: %s", rewritten)
+	}
+
+	// 7. max_offset 可配置
+	if _, err = ValidateAndRewriteSQLWithSchema("SELECT id FROM users LIMIT 500, 10", "", 100, 100, blacklist); err == nil {
+		t.Fatalf("expected error when offset exceeds configured max_offset=100, got nil")
+	}
+
+	// 8. EXPLAIN ANALYZE 内的超限 offset 同样拒绝
+	if _, err = ValidateAndRewriteSQL("EXPLAIN ANALYZE SELECT * FROM users LIMIT 100000000, 10", 100, blacklist); err == nil {
+		t.Fatalf("expected offset rejection inside EXPLAIN ANALYZE, got nil")
 	}
 }

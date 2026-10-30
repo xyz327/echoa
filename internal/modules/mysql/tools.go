@@ -264,7 +264,7 @@ func (m *Module) HandleQuery(ctx context.Context, claims *casdoorsdk.Claims, arg
 	}
 
 	// 1. AST 语法强校验、可选 schema 补充与强制 LIMIT 改写
-	safeSQL, err := ValidateAndRewriteSQLWithSchema(query, customSchema, maxLimit, m.cfg.Security.TableBlacklist)
+	safeSQL, err := ValidateAndRewriteSQLWithSchema(query, customSchema, maxLimit, m.cfg.Security.MaxOffset, m.cfg.Security.TableBlacklist)
 	if err != nil {
 		return "", fmt.Errorf("security check failed: %w", err)
 	}

@@ -56,12 +56,20 @@ func (m *Module) HandleExecute(ctx context.Context, claims *casdoorsdk.Claims, a
 		return "", err
 	}
 
-	// 4. 解析命令参数
+	// 4. 解析命令参数，并在发往 Redis 之前按命令语义收紧上限。
+	//    这一步是查询侧限制：LRANGE 0 -1 / HSCAN COUNT 1000000 这类写法如果放行，
+	//    Redis 会先把完整结果算完并传回来，输出侧截断已经来不及保护实例和内存。
 	rawArgs, _ := args["args"].([]any)
-	execArgs := make([]any, 0, len(rawArgs)+1)
-	execArgs = append(execArgs, cmdName)
+	cmdArgs := make([]string, 0, len(rawArgs))
 	for _, arg := range rawArgs {
-		execArgs = append(execArgs, fmt.Sprintf("%v", arg))
+		cmdArgs = append(cmdArgs, fmt.Sprintf("%v", arg))
+	}
+	cmdArgs, clampNotes := clampArgs(cmdName, cmdArgs, m.cfg.MaxItemsLimit)
+
+	execArgs := make([]any, 0, len(cmdArgs)+1)
+	execArgs = append(execArgs, cmdName)
+	for _, arg := range cmdArgs {
+		execArgs = append(execArgs, arg)
 	}
 
 	// 5. 动态执行（附带超时控制）
@@ -76,7 +84,15 @@ func (m *Module) HandleExecute(ctx context.Context, claims *casdoorsdk.Claims, a
 		return "", fmt.Errorf("redis execution failed: %w", err)
 	}
 
-	return formatAndTruncateResult(val, m.cfg.MaxItemsLimit)
+	out, err := formatAndTruncateResult(val, m.cfg.MaxItemsLimit)
+	if err != nil {
+		return "", err
+	}
+	if len(clampNotes) > 0 {
+		out += "\n\n[limited] " + strings.Join(clampNotes, "; ") +
+			". The result reflects the clamped range, not the full request."
+	}
+	return out, nil
 }
 
 // HandleScanKeys 安全遍历匹配的 Key

@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/pingcap/tidb/pkg/parser"
@@ -105,13 +106,18 @@ func IsTableBlacklisted(schema, table string, blacklist []string) bool {
 	return false
 }
 
+// DefaultMaxQueryOffset 是未显式配置 security.max_offset 时的 OFFSET 硬上限。
+// OFFSET 不限制返回行数，却要求服务端先把前面所有行扫过并丢弃，是 LIMIT 改写之外
+// 另一个能把小查询放大成全表扫描的口子。
+const DefaultMaxQueryOffset = 100000
+
 // ValidateAndRewriteSQL 校验 SQL 语句并注入/改写 LIMIT（保持无默认 schema 兼容）
 func ValidateAndRewriteSQL(sqlStr string, maxLimit int, blacklist []string) (string, error) {
-	return ValidateAndRewriteSQLWithSchema(sqlStr, "", maxLimit, blacklist)
+	return ValidateAndRewriteSQLWithSchema(sqlStr, "", maxLimit, DefaultMaxQueryOffset, blacklist)
 }
 
 // ValidateAndRewriteSQLWithSchema 校验 SQL 语句，若传入 defaultSchema，自动为无前缀的数据表补充 schema 限定
-func ValidateAndRewriteSQLWithSchema(sqlStr string, defaultSchema string, maxLimit int, blacklist []string) (string, error) {
+func ValidateAndRewriteSQLWithSchema(sqlStr string, defaultSchema string, maxLimit, maxOffset int, blacklist []string) (string, error) {
 	trimmed := strings.TrimSpace(sqlStr)
 	// 去除末尾分号
 	trimmed = strings.TrimRight(trimmed, ";")
@@ -147,12 +153,36 @@ func ValidateAndRewriteSQLWithSchema(sqlStr string, defaultSchema string, maxLim
 	switch s := stmt.(type) {
 	case *ast.SelectStmt:
 		isQuery = true
-		rewriteLimit(s.Limit, maxLimit, func(l *ast.Limit) { s.Limit = l })
+		if err := rewriteLimit(s.Limit, maxLimit, maxOffset, func(l *ast.Limit) { s.Limit = l }); err != nil {
+			return "", err
+		}
 	case *ast.SetOprStmt:
 		isQuery = true
-		rewriteLimit(s.Limit, maxLimit, func(l *ast.Limit) { s.Limit = l })
+		if err := rewriteLimit(s.Limit, maxLimit, maxOffset, func(l *ast.Limit) { s.Limit = l }); err != nil {
+			return "", err
+		}
 	case *ast.ExplainStmt:
-		// EXPLAIN 允许通过
+		// EXPLAIN 的语法同样接受 INSERT/UPDATE/DELETE，只读工具只放行 SELECT / UNION。
+		// 普通 EXPLAIN 只读执行计划可以原样通过；但 EXPLAIN ANALYZE（MySQL 8.0.18+ / MariaDB）
+		// 会真正执行内层语句，不注入 LIMIT 等于把 max_limit 整个绕开，因此按普通查询同等对待。
+		switch inner := s.Stmt.(type) {
+		case *ast.SelectStmt:
+			if s.Analyze {
+				isQuery = true
+				if err := rewriteLimit(inner.Limit, maxLimit, maxOffset, func(l *ast.Limit) { inner.Limit = l }); err != nil {
+					return "", err
+				}
+			}
+		case *ast.SetOprStmt:
+			if s.Analyze {
+				isQuery = true
+				if err := rewriteLimit(inner.Limit, maxLimit, maxOffset, func(l *ast.Limit) { inner.Limit = l }); err != nil {
+					return "", err
+				}
+			}
+		default:
+			return "", fmt.Errorf("EXPLAIN is only allowed on SELECT/UNION statements in read-only mode, got: %T", s.Stmt)
+		}
 	case *ast.ShowStmt:
 		// SHOW 允许通过；若指定了 defaultSchema 且为 SHOW TABLES，为其补充 FROM <defaultSchema>
 		if defaultSchema != "" && s.Tp == ast.ShowTables && s.DBName == "" {
@@ -197,16 +227,19 @@ func ValidateAndRewriteSQLWithSchema(sqlStr string, defaultSchema string, maxLim
 	return trimmed, nil
 }
 
-func rewriteLimit(currentLimit *ast.Limit, maxLimit int, setLimit func(*ast.Limit)) {
+func rewriteLimit(currentLimit *ast.Limit, maxLimit, maxOffset int, setLimit func(*ast.Limit)) error {
 	if maxLimit <= 0 {
 		maxLimit = 200
+	}
+	if err := checkLimitOffset(currentLimit, maxOffset); err != nil {
+		return err
 	}
 
 	if currentLimit == nil {
 		setLimit(&ast.Limit{
 			Count: ast.NewValueExpr(maxLimit, "", ""),
 		})
-		return
+		return nil
 	}
 
 	needRewrite := false
@@ -232,4 +265,42 @@ func rewriteLimit(currentLimit *ast.Limit, maxLimit int, setLimit func(*ast.Limi
 	if needRewrite {
 		currentLimit.Count = ast.NewValueExpr(maxLimit, "", "")
 	}
+	return nil
+}
+
+// checkLimitOffset 拒绝超过上限的 OFFSET。返回行数已经受 max_limit 约束，但 OFFSET 越大，
+// 服务端要先扫过并丢弃的行数就越多（LIMIT 100000000, 10 依然是一次全表扫描），
+// 因此 offset 必须有独立上限；这里选择拒绝而不是改写，改写会静默改变查询语义。
+func checkLimitOffset(currentLimit *ast.Limit, maxOffset int) error {
+	if currentLimit == nil || currentLimit.Offset == nil {
+		return nil
+	}
+	if maxOffset <= 0 {
+		maxOffset = DefaultMaxQueryOffset
+	}
+
+	valExpr, ok := currentLimit.Offset.(ast.ValueExpr)
+	if !ok {
+		return fmt.Errorf("LIMIT offset must be a literal integer to be verified against max_offset")
+	}
+
+	var offset int64
+	switch v := valExpr.GetValue().(type) {
+	case int64:
+		offset = v
+	case uint64:
+		if v > math.MaxInt64 {
+			return fmt.Errorf("LIMIT offset %d exceeds the maximum allowed offset (%d)", uint64(v), maxOffset)
+		}
+		offset = int64(v)
+	case int:
+		offset = int64(v)
+	default:
+		return fmt.Errorf("LIMIT offset must be a literal integer to be verified against max_offset")
+	}
+
+	if offset > int64(maxOffset) {
+		return fmt.Errorf("LIMIT offset %d exceeds the maximum allowed offset (%d), narrow the query instead of deep paging", offset, maxOffset)
+	}
+	return nil
 }

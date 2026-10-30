@@ -45,7 +45,7 @@
 3. **MySQL 深度 AST 防御体系与可选 Schema**：
    - 基于 `pingcap/tidb/pkg/parser` 对传入 SQL 做抽象语法树（AST）强校验，仅允许 `SELECT`、`EXPLAIN`、`SHOW`。
    - 彻底拦截 `SELECT ... FOR UPDATE`、`LOCK IN SHARE MODE` 等加锁读取，以及 `SELECT ... INTO OUTFILE / DUMPFILE` 等服务端写盘提权语句。
-   - 智能 LIMIT 注入与改写：无 LIMIT 自动追加系统上限；超过配置上限强制压低改写；保留原分页 offset；子查询与外层查询严格隔离改写。
+   - 智能 LIMIT 注入与改写：无 LIMIT 自动追加系统上限；超过配置上限强制压低改写；保留原分页 offset 并受 `max_offset` 上限约束；子查询与外层查询严格隔离改写；`EXPLAIN ANALYZE`（会真正执行内层语句）与普通 SELECT 同等注入 LIMIT，避免绕过行数上限。
    - 跨库支持与可选 Schema：DSN 允许省略默认数据库（非强制绑定），提供 `mysql_list_databases` 数据库发现；`mysql_list_tables` / `mysql_describe_table` 支持参数指定 schema 或 `schema.table` 格式；`mysql_query` 在 AST 层自动补全 schema 限定，**杜绝并发调用 `USE db` 导致连接池污染**。
    - 敏感数据表黑名单过滤（支持 `table` 与 `schema.table` 精准匹配拦截）。
    - 双重防撑爆防护：单单元格 4KB 缩略截断 + 结果集 64KB 字符级硬上限。
@@ -140,7 +140,7 @@
   ```
 
 #### `mysql_query`
-执行只读 SQL 查询。服务端进行 TiDB AST 审查，仅允许 `SELECT`、`EXPLAIN`、`SHOW`，并自动追加或改写 `LIMIT`。
+执行只读 SQL 查询。服务端进行 TiDB AST 审查，仅允许 `SELECT`、`EXPLAIN`、`SHOW`，并自动追加或改写 `LIMIT`；`EXPLAIN ANALYZE`（MySQL 8.0.18+ / MariaDB 会真正执行内层语句）与普通 SELECT 同样注入 `LIMIT`，且 `EXPLAIN` 仅允许作用于 `SELECT`/`UNION`（拒绝 `EXPLAIN ANALYZE DELETE/UPDATE/INSERT`）；分页 `OFFSET` 超过 `max_offset` 直接拒绝，避免「返回 10 行却扫了一亿行」的深分页。
 - **参数**：
   - `query` (`string`, 必填): 待执行的 SQL 语句。支持同一实例下的跨库查询（例如 `SELECT * FROM billing.orders JOIN crm.users ON ...`）。
   - `schema` (`string`, 可选): 可选的默认数据库/schema 名称。若传入，服务端会在 AST 解析阶段自动为未带前缀的数据表补充限定（例如把 `SELECT * FROM orders` 自动补全为 `SELECT * FROM billing.orders`），**杜绝在连接池复用环境下调用 `USE db` 引发的连接污染隐患**。
@@ -173,6 +173,7 @@
   - 严禁传入 `KEYS` 命令（请使用 `redis_scan_keys` 或 `SCAN`）。
   - 严禁执行 `SELECT` 命令（请通过 `db` 参数指定数据库）。
   - 严禁任何写入或高危管理命令（`SET`, `DEL`, `FLUSHALL`, `CONFIG`, `EVAL` 等）。
+  - **参数前置钳制**：命令在发往 Redis **之前**会按语义收紧参数，而不是等完整结果回到内存后再截断——`LRANGE/ZRANGE/ZREVRANGE` 的 `stop` 收敛为 `start + max_items_limit - 1`（`LRANGE key 0 -1` → `0 199`）；`HSCAN/SSCAN/ZSCAN/SCAN` 的 `COUNT` 压到 `max_items_limit`；`ZRANGEBYSCORE/ZRANGEBYLEX` 无 `LIMIT` 时自动补 `LIMIT 0 <max_items_limit>`；`MGET` 超过上限时截断 key 列表；`SRANDMEMBER` 的 `count` 与 `GETRANGE` 的字节区间同样受限。发生改写时响应末尾会追加 `[limited]` 提示，说明实际执行的范围。
 
 #### `redis_scan_keys`
 使用游标 `SCAN` 安全遍历匹配 Glob 模式的 Key，分批迭代，杜绝生产环境阻塞。
@@ -228,16 +229,16 @@
                        │
        ┌───────────────┴───────────────┐
        ▼                               ▼
-[ 3. MySQL 只读防御 ]            [ 4. Redis 只读防御 ]
- ├─ TiDB AST 强语法校验           ├─ MultiDBManager 独立连接池
- ├─ 仅限 SELECT/EXPLAIN/SHOW      ├─ 杜绝并发 SELECT 串库漏洞
- ├─ 阻断 FOR UPDATE / 锁读         ├─ 强阻断 KEYS / CONFIG / FLUSH
- ├─ 阻断 INTO OUTFILE 写盘        ├─ 允许命令白名单机制
- ├─ 黑名单表拒绝访问               ├─ SCAN 游标安全分页防阻塞
- ├─ 强制智能注入 / 压低 LIMIT      └─ 双重截断保护:
- └─ 双重截断保护:                     ├─ 条目数截断 (max_items_limit)
-     ├─ 单元格 4KB 截断              └─ 响应体 64KB 字符级截断
-     └─ 结果集 64KB 硬上限
+[ 3. MySQL 只读防御 ]                [ 4. Redis 只读防御 ]
+ ├─ TiDB AST 强语法校验              ├─ MultiDBManager 独立连接池
+ ├─ 仅限 SELECT/EXPLAIN/SHOW         ├─ 杜绝并发 SELECT 串库漏洞
+ ├─ 阻断 FOR UPDATE / 锁读            ├─ 强阻断 KEYS / CONFIG / FLUSH
+ ├─ 阻断 INTO OUTFILE 写盘           ├─ 允许命令白名单机制
+ ├─ 黑名单表拒绝访问                  ├─ SCAN 游标安全分页防阻塞
+ ├─ 强制注入 / 压低 LIMIT             ├─ range/COUNT/MGET 参数前置钳制
+ ├─ OFFSET 上限拒绝深分页             ├─ 条目数截断 (max_items_limit)
+ ├─ EXPLAIN ANALYZE 同样注入 LIMIT    └─ 响应体 64KB 字符级截断
+ └─ 单元格 4KB + 结果集 64KB 截断
 ```
 
 ---
@@ -279,6 +280,7 @@ sources:
       query_timeout_ms: 5000      # 单次查询超时时间 (毫秒)
       security:
         max_limit: 200            # 单次查询强制限制的最大返回行数
+        max_offset: 100000        # 分页 OFFSET 上限，超出直接拒绝（防深分页全表扫描）
         table_blacklist:          # 敏感表黑名单 (支持 "table" 或 "db.table")
           - "user_password"
           - "auth_tokens"
