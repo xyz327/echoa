@@ -16,7 +16,7 @@ func TestRedisSecurityPolicy(t *testing.T) {
 		Addr:       "127.0.0.1:6379",
 		AllowedDBs: []int{0, 1, 2},
 		Security: config.RedisSecurityConfig{
-			AllowedCommands: []string{"GET", "HGETALL", "SCAN", "LRANGE"},
+			AllowedCommands: []string{"GET", "HSCAN", "SCAN", "LRANGE"},
 			BlockedCommands: []string{"MONITOR"},
 		},
 	}
@@ -67,6 +67,15 @@ func TestRedisSecurityPolicy(t *testing.T) {
 	_, err = m.HandleExecute(ctx, nil, map[string]any{"command": "INFO", "args": []any{}})
 	if err == nil || !strings.Contains(err.Error(), "not in the allowed read-only whitelist") {
 		t.Fatalf("expected INFO command to be not in whitelist, got err: %v", err)
+	}
+
+	// 5b. 没有可收窄参数、会整块返回的命令不在白名单（HGETALL/HKEYS/HVALS/SMEMBERS），
+	//     应走与 INFO 相同的拒绝路径，引导调用方改用 HSCAN/SSCAN。
+	for _, cmd := range []string{"HGETALL", "HKEYS", "HVALS", "SMEMBERS"} {
+		_, err = m.HandleExecute(ctx, nil, map[string]any{"command": cmd, "args": []any{"big_collection"}})
+		if err == nil || !strings.Contains(err.Error(), "not in the allowed read-only whitelist") {
+			t.Fatalf("expected %s to be rejected as not whitelisted, got err: %v", cmd, err)
+		}
 	}
 
 	// 6. 测试未授权的 DB 访问 (如 DB 9)

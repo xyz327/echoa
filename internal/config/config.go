@@ -65,6 +65,7 @@ type SourceRef struct {
 
 type MySQLSecurityConfig struct {
 	MaxLimit       int      `mapstructure:"max_limit"`
+	MaxOffset      int      `mapstructure:"max_offset"`
 	TableBlacklist []string `mapstructure:"table_blacklist"`
 }
 
@@ -230,6 +231,9 @@ func expandEnvs(cfg *Config) {
 		src.DSN = expandEnvWithDefault(src.DSN)
 		if src.Security.MaxLimit <= 0 {
 			src.Security.MaxLimit = 200
+		}
+		if src.Security.MaxOffset <= 0 {
+			src.Security.MaxOffset = 100000
 		}
 		if src.QueryTimeoutMS <= 0 {
 			src.QueryTimeoutMS = 5000

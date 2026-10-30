@@ -118,14 +118,17 @@ func registerTools(registry *mcp.ToolRegistry, name string, m *Module, qualify b
 	// 1. 注册统一命令网关 redis_execute
 	registry.Register(&mcp.ToolDefinition{
 		Name: prefix + "_execute",
-		Description: "Execute a read-only Redis command (e.g. GET, HGETALL, LRANGE, SMEMBERS, ZRANGE, TYPE, TTL). " +
+		Description: "Execute a read-only Redis command (e.g. GET, HGET, LRANGE, ZRANGE, TYPE, TTL). " +
+			"Commands that return a whole collection with no way to bound it (HGETALL, HKEYS, HVALS, SMEMBERS) are not allowed: " +
+			"use HSCAN/SSCAN instead, whose COUNT is clamped server-side. " +
+			"Range and COUNT arguments are clamped to the configured limit before execution. " +
 			"Supports optional 'db' argument (0-15, default 0). Dangerous/write commands are strictly forbidden. Source: " + name + ".",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"command": map[string]any{
 					"type":        "string",
-					"description": "Redis command name (e.g. 'GET', 'HGETALL', 'LRANGE')",
+					"description": "Redis command name (e.g. 'GET', 'HSCAN', 'LRANGE'). HGETALL/HKEYS/HVALS/SMEMBERS are not allowed; use HSCAN/SSCAN.",
 				},
 				"args": map[string]any{
 					"type":        "array",

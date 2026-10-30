@@ -66,6 +66,9 @@ func TestLoadTwoMySQLEndpoints(t *testing.T) {
 	if got := cfg.Sources.MySQL["billing"].Security.MaxLimit; got != 200 {
 		t.Errorf("billing max_limit = %d, want default 200", got)
 	}
+	if got := cfg.Sources.MySQL["orders"].Security.MaxOffset; got != 100000 {
+		t.Errorf("orders max_offset = %d, want default 100000", got)
+	}
 	if got := cfg.Sources.Redis["cache"].PoolSize; got != 20 {
 		t.Errorf("redis pool_size = %d, want default 20", got)
 	}
