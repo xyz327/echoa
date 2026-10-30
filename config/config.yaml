@@ -55,16 +55,14 @@ sources:
           - "GETRANGE"
           - "HGET"
           - "HMGET"
-          - "HGETALL"
-          - "HKEYS"
-          - "HVALS"
+          # HGETALL/HKEYS/HVALS 没有可收窄的参数，大 hash 会整块返回；用 HSCAN 代替（COUNT 已前置钳制）。
           - "HLEN"
           - "HEXISTS"
           - "HSCAN"
           - "LRANGE"
           - "LINDEX"
           - "LLEN"
-          - "SMEMBERS"
+          # SMEMBERS 没有可收窄的参数，大 set 会整块返回；用 SSCAN 代替（COUNT 已前置钳制）。
           - "SISMEMBER"
           - "SCARD"
           - "SRANDMEMBER"

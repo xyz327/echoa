@@ -164,15 +164,16 @@
 ### 2. Redis 工具
 
 #### `redis_execute`
-统一只读命令网关，支持常用读取命令（如 `GET`, `MGET`, `HGETALL`, `LRANGE`, `SMEMBERS`, `ZRANGE`, `TTL`, `TYPE` 等）。
+统一只读命令网关，支持常用读取命令（如 `GET`, `MGET`, `HGET`, `LRANGE`, `ZRANGE`, `TTL`, `TYPE` 等）。
 - **参数**：
-  - `command` (`string`, 必填): 命令名称（大小写不敏感），如 `"HGETALL"`、`"GET"`。
+  - `command` (`string`, 必填): 命令名称（大小写不敏感），如 `"HGET"`、`"GET"`。
   - `args` (`array[string]`, 必填): 命令参数列表，例如 `["user:profile:1001"]`。
   - `db` (`integer`, 可选, 默认 `0`): 目标逻辑库索引（需在 `allowed_dbs` 允许列表内）。
 - **注意**：
   - 严禁传入 `KEYS` 命令（请使用 `redis_scan_keys` 或 `SCAN`）。
   - 严禁执行 `SELECT` 命令（请通过 `db` 参数指定数据库）。
   - 严禁任何写入或高危管理命令（`SET`, `DEL`, `FLUSHALL`, `CONFIG`, `EVAL` 等）。
+  - **`HGETALL`/`HKEYS`/`HVALS`/`SMEMBERS` 不在默认白名单**：这四条命令的参数里没有任何可收窄的位置，大 hash/set 会整块从 Redis 传回，输出侧截断来不及保护内存。请改用 `HSCAN`/`SSCAN`，它们的 `COUNT` 会在执行前被钳到 `max_items_limit`。`GET` 保留（单 key 取值是最常用命令），但单个 value 的大小不受 echoa 控制，上限取决于 Redis 的 `proto-max-bulk-len`。
   - **参数前置钳制**：命令在发往 Redis **之前**会按语义收紧参数，而不是等完整结果回到内存后再截断——`LRANGE/ZRANGE/ZREVRANGE` 的 `stop` 收敛为 `start + max_items_limit - 1`（`LRANGE key 0 -1` → `0 199`）；`HSCAN/SSCAN/ZSCAN/SCAN` 的 `COUNT` 压到 `max_items_limit`；`ZRANGEBYSCORE/ZRANGEBYLEX` 无 `LIMIT` 时自动补 `LIMIT 0 <max_items_limit>`；`MGET` 超过上限时截断 key 列表；`SRANDMEMBER` 的 `count` 与 `GETRANGE` 的字节区间同样受限。发生改写时响应末尾会追加 `[limited]` 提示，说明实际执行的范围。
 
 #### `redis_scan_keys`
@@ -304,16 +305,14 @@ sources:
         - "GETRANGE"
         - "HGET"
         - "HMGET"
-        - "HGETALL"
-        - "HKEYS"
-        - "HVALS"
+        # HGETALL/HKEYS/HVALS 会把整个 hash 整块返回，没有可收窄的参数，已移除；改用 HSCAN。
         - "HLEN"
         - "HEXISTS"
         - "HSCAN"
         - "LRANGE"
         - "LINDEX"
         - "LLEN"
-        - "SMEMBERS"
+        # SMEMBERS 会把整个 set 整块返回，没有可收窄的参数，已移除；改用 SSCAN。
         - "SISMEMBER"
         - "SCARD"
         - "SRANDMEMBER"
