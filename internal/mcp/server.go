@@ -5,14 +5,16 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
 	"echoa/internal/auth"
+	"echoa/internal/logger"
 	"github.com/casdoor/casdoor-go-sdk/casdoorsdk"
+	"github.com/google/uuid"
 )
 
 type Server struct {
@@ -37,6 +39,19 @@ func (s *Server) Close() {
 
 // ServeHTTP 处理无状态 MCP 2026-07-28 Streamable HTTP 请求
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	reqID := r.Header.Get("X-Request-ID")
+	if reqID == "" {
+		reqID = uuid.NewString()
+	}
+	w.Header().Set("X-Request-ID", reqID)
+
+	ctx := logger.WithRequestID(r.Context(), reqID)
+	ctx = logger.WithEndpoint(ctx, s.endpointPath)
+	if claims, ok := auth.ClaimsFrom(ctx); ok {
+		ctx = logger.WithPrincipal(ctx, extractPrincipal(claims))
+	}
+	r = r.WithContext(ctx)
+
 	// 1. HTTP 请求方法校验：只接受 POST，GET 与 DELETE 均返回 405 Method Not Allowed
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -352,21 +367,21 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request, req JSONRPCReq
 		elapsed := time.Since(start)
 
 		// 结构化 JSON 审计日志
-		auditEntry := map[string]any{
-			"timestamp":  time.Now().UTC().Format(time.RFC3339),
-			"endpoint":   s.endpointPath,
-			"request_id": req.ID,
-			"user":       principal,
-			"tool":       callParams.Name,
-			"args":       sanitizeAuditArgs(callParams.Arguments),
-			"latency_ms": elapsed.Milliseconds(),
-			"success":    err == nil,
+		auditAttrs := []any{
+			slog.String("log_type", "audit"),
+			slog.String("tool", callParams.Name),
+			slog.Any("args", sanitizeAuditArgs(callParams.Arguments)),
+			slog.Int64("latency_ms", elapsed.Milliseconds()),
+			slog.Bool("success", err == nil),
+		}
+		if req.ID != nil {
+			auditAttrs = append(auditAttrs, slog.Any("rpc_id", req.ID))
 		}
 		if err != nil {
-			auditEntry["error"] = err.Error()
-		}
-		if auditJSON, marshalErr := json.Marshal(auditEntry); marshalErr == nil {
-			log.Printf("[AUDIT] %s", string(auditJSON))
+			auditAttrs = append(auditAttrs, slog.String("error", err.Error()))
+			slog.WarnContext(r.Context(), "MCP tool execution failed", auditAttrs...)
+		} else {
+			slog.InfoContext(r.Context(), "MCP tool execution succeeded", auditAttrs...)
 		}
 
 		if err != nil {

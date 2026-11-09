@@ -5,10 +5,12 @@ go 1.27.3
 require (
 	github.com/casdoor/casdoor-go-sdk v1.59.0
 	github.com/go-sql-driver/mysql v1.7.1
+	github.com/golang-jwt/jwt/v4 v4.5.0
 	github.com/google/uuid v1.6.0
 	github.com/pingcap/tidb/pkg/parser v0.0.0-20261022084217-0766a90d525d
 	github.com/redis/go-redis/v9 v9.23.0
 	github.com/spf13/viper v1.21.0
+	golang.org/x/sync v0.21.0
 )
 
 require (
@@ -16,7 +18,6 @@ require (
 	github.com/coreos/go-semver v0.3.1 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
-	github.com/golang-jwt/jwt/v4 v4.5.0 // indirect
 	github.com/golang/protobuf v1.5.3 // indirect
 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
 	github.com/pingcap/errors v0.11.5-0.20250523034308-74f78ae071ee // indirect

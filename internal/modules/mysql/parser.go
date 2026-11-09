@@ -4,12 +4,34 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/format"
 	_ "github.com/pingcap/tidb/pkg/parser/test_driver"
 )
+
+var parserPool = sync.Pool{
+	New: func() any {
+		return parser.New()
+	},
+}
+
+// blockedMySQLFunctions 列出禁止在只读模式下调用的高危/DoS 函数
+var blockedMySQLFunctions = map[string]bool{
+	"sleep":             true, // DoS: 线程挂起与时间盲注
+	"benchmark":         true, // DoS: CPU 密集空转消耗服务端算力
+	"load_file":         true, // 敏感信息泄露: 读取服务端宿主机磁盘文件
+	"get_lock":          true, // 互斥锁: 可能导致其他会话死锁或无限阻塞
+	"release_lock":      true, // 互斥锁控制
+	"release_all_locks": true, // 互斥锁控制
+	"is_free_lock":      true, // 锁状态探测
+	"is_used_lock":      true, // 锁状态探测
+	"sys_eval":          true, // UDF 代码执行高危函数
+	"sys_exec":          true, // UDF 代码执行高危函数
+	"sys_get":           true, // UDF 代码执行高危函数
+}
 
 type tableRef struct {
 	schema string
@@ -35,8 +57,9 @@ func (v *tableVisitor) Leave(in ast.Node) (ast.Node, bool) {
 }
 
 type safetyVisitor struct {
-	hasInto bool
-	hasLock bool
+	hasInto     bool
+	hasLock     bool
+	blockedFunc string
 }
 
 func (v *safetyVisitor) Enter(in ast.Node) (ast.Node, bool) {
@@ -46,6 +69,12 @@ func (v *safetyVisitor) Enter(in ast.Node) (ast.Node, bool) {
 		}
 		if s.LockInfo != nil && s.LockInfo.LockType != ast.SelectLockNone {
 			v.hasLock = true
+		}
+	}
+	if fn, ok := in.(*ast.FuncCallExpr); ok {
+		fnName := strings.ToLower(fn.FnName.L)
+		if blockedMySQLFunctions[fnName] {
+			v.blockedFunc = fn.FnName.O
 		}
 	}
 	return in, false
@@ -124,7 +153,8 @@ func ValidateAndRewriteSQLWithSchema(sqlStr string, defaultSchema string, maxLim
 	trimmed = strings.TrimSpace(trimmed)
 	defaultSchema = strings.TrimSpace(strings.Trim(defaultSchema, "`"))
 
-	p := parser.New()
+	p := parserPool.Get().(*parser.Parser)
+	defer parserPool.Put(p)
 	stmts, _, err := p.Parse(trimmed, "", "")
 	if err != nil {
 		return "", fmt.Errorf("SQL syntax error: %w", err)
@@ -140,7 +170,7 @@ func ValidateAndRewriteSQLWithSchema(sqlStr string, defaultSchema string, maxLim
 	stmt := stmts[0]
 	isQuery := false
 
-	// 深度只读安全审查：遍历 AST 树拦截任意层级的 SELECT INTO 写盘与加锁读取 (FOR UPDATE / LOCK IN SHARE MODE)
+	// 深度只读安全审查：遍历 AST 树拦截任意层级的 SELECT INTO 写盘、加锁读取与高危/DoS 函数
 	sv := &safetyVisitor{}
 	stmt.Accept(sv)
 	if sv.hasInto {
@@ -148,6 +178,9 @@ func ValidateAndRewriteSQLWithSchema(sqlStr string, defaultSchema string, maxLim
 	}
 	if sv.hasLock {
 		return "", fmt.Errorf("locking read statements (FOR UPDATE, LOCK IN SHARE MODE) are strictly forbidden in read-only mode")
+	}
+	if sv.blockedFunc != "" {
+		return "", fmt.Errorf("function '%s' is strictly forbidden by security policy", sv.blockedFunc)
 	}
 
 	switch s := stmt.(type) {

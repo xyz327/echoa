@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -82,10 +82,12 @@ func CasdoorMiddlewareWithJWKS(cfg config.AuthConfig, client *casdoorsdk.Client,
 			if token == "" {
 				q := r.URL.Query()
 				if qToken := q.Get("token"); qToken != "" {
-					log.Printf("[WARN] Deprecated: Client (%s) sent token in query parameter 'token'. Please use 'Authorization: Bearer <token>' header instead to prevent token leakage in proxy logs.", clientIP(r))
+					slog.Warn("Deprecated: Client sent token in query parameter 'token'. Please use 'Authorization: Bearer <token>' header instead to prevent token leakage in proxy logs.",
+						slog.String("client_ip", clientIP(r)))
 					token = qToken
 				} else if qAccessToken := q.Get("access_token"); qAccessToken != "" {
-					log.Printf("[WARN] Deprecated: Client (%s) sent token in query parameter 'access_token'. Please use 'Authorization: Bearer <token>' header instead to prevent token leakage in proxy logs.", clientIP(r))
+					slog.Warn("Deprecated: Client sent token in query parameter 'access_token'. Please use 'Authorization: Bearer <token>' header instead to prevent token leakage in proxy logs.",
+						slog.String("client_ip", clientIP(r)))
 					token = qAccessToken
 				}
 			}

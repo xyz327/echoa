@@ -348,4 +348,35 @@ func TestExplainAnalyzeAndOffsetLimits(t *testing.T) {
 	if _, err = ValidateAndRewriteSQL("EXPLAIN ANALYZE SELECT * FROM users LIMIT 100000000, 10", 100, blacklist); err == nil {
 		t.Fatalf("expected offset rejection inside EXPLAIN ANALYZE, got nil")
 	}
+
+	// 9. 高危/DoS 内置函数拦截测试
+	blockedQueries := []struct {
+		sql      string
+		funcName string
+	}{
+		{"SELECT SLEEP(5)", "SLEEP"},
+		{"SELECT sleep(10) FROM users", "sleep"},
+		{"SELECT BENCHMARK(1000000, MD5('test'))", "BENCHMARK"},
+		{"SELECT LOAD_FILE('/etc/passwd')", "LOAD_FILE"},
+		{"SELECT GET_LOCK('lock1', 10)", "GET_LOCK"},
+		{"SELECT RELEASE_LOCK('lock1')", "RELEASE_LOCK"},
+		{"SELECT RELEASE_ALL_LOCKS()", "RELEASE_ALL_LOCKS"},
+		{"SELECT IS_FREE_LOCK('lock1')", "IS_FREE_LOCK"},
+		{"SELECT IS_USED_LOCK('lock1')", "IS_USED_LOCK"},
+		{"SELECT sys_eval('id')", "sys_eval"},
+		{"SELECT sys_exec('rm -rf /')", "sys_exec"},
+		{"SELECT sys_get('PATH')", "sys_get"},
+		{"SELECT id FROM users WHERE SLEEP(1) = 0", "SLEEP"},
+		{"SELECT * FROM (SELECT SLEEP(2) FROM dual) t", "SLEEP"},
+	}
+
+	for _, tc := range blockedQueries {
+		_, err := ValidateAndRewriteSQL(tc.sql, 100, blacklist)
+		if err == nil {
+			t.Errorf("expected query %q to be blocked, but it passed", tc.sql)
+		} else if !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(tc.funcName)) ||
+			!strings.Contains(err.Error(), "strictly forbidden") {
+			t.Errorf("expected error message to mention forbidden function %q, got: %v", tc.funcName, err)
+		}
+	}
 }
