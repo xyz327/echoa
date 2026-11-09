@@ -3,14 +3,21 @@ package redis
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
 	"echoa/internal/config"
+	"echoa/internal/datasource"
 	"echoa/internal/mcp"
 	"github.com/redis/go-redis/v9"
 )
+
+func init() {
+	datasource.Register(config.SourceKindRedis, func(ref config.SourceRef) (datasource.Instance, error) {
+		return Open(ref.Name, ref.Redis)
+	})
+}
 
 type Module struct {
 	cfg        config.RedisConfig
@@ -37,23 +44,13 @@ func (m *Module) Ping(ctx context.Context) error {
 	return client.Ping(ctx).Err()
 }
 
-// Register 把一份 Redis 配置注册成一组只读工具。
-// qualify 为 false 时工具名是 redis_execute；同一个 endpoint 挂多个 Redis 时带上 source 名字。
-func Register(registry *mcp.ToolRegistry, name string, cfg config.RedisConfig, qualify bool) (*Module, error) {
-	return registerModule(registry, name, cfg, qualify, nil)
+// RegisterTools 满足 datasource.Instance 接口，向 ToolRegistry 注册 Redis 工具
+func (m *Module) RegisterTools(registry *mcp.ToolRegistry, sourceName string, qualify bool) {
+	registerTools(registry, sourceName, m, qualify)
 }
 
-// RegisterExisting 把已经建好连接池的模块再注册到另一个 endpoint 的工具表，不再新开连接。
-func RegisterExisting(registry *mcp.ToolRegistry, name string, m *Module, qualify bool) {
-	_, _ = registerModule(registry, name, m.cfg, qualify, m)
-}
-
-func registerModule(registry *mcp.ToolRegistry, name string, cfg config.RedisConfig, qualify bool, existing *Module) (*Module, error) {
-	if existing != nil {
-		registerTools(registry, name, existing, qualify)
-		return existing, nil
-	}
-
+// Open 初始化 Redis 连接池管理器并执行探活
+func Open(name string, cfg config.RedisConfig) (*Module, error) {
 	allowedMap := make(map[string]bool)
 	for _, cmd := range cfg.Security.AllowedCommands {
 		allowedMap[strings.ToUpper(strings.TrimSpace(cmd))] = true
@@ -85,12 +82,26 @@ func registerModule(registry *mcp.ToolRegistry, name string, cfg config.RedisCon
 		blockedMap: blockedMap,
 	}
 
-	pingRedis(m, cfg.Addr)
-	registerTools(registry, name, m, qualify)
+	pingRedis(m, name, cfg.Addr)
 	return m, nil
 }
 
-func pingRedis(m *Module, addr string) {
+// Register 把一份 Redis 配置注册成一组只读工具。
+func Register(registry *mcp.ToolRegistry, name string, cfg config.RedisConfig, qualify bool) (*Module, error) {
+	m, err := Open(name, cfg)
+	if err != nil {
+		return nil, err
+	}
+	m.RegisterTools(registry, name, qualify)
+	return m, nil
+}
+
+// RegisterExisting 把已经建好连接池的模块再注册到另一个 endpoint 的工具表，不再新开连接。
+func RegisterExisting(registry *mcp.ToolRegistry, name string, m *Module, qualify bool) {
+	m.RegisterTools(registry, name, qualify)
+}
+
+func pingRedis(m *Module, name, addr string) {
 	// 启动探活（超时 3 秒），失败打印警告日志以兼顾本地无 DB 开发。
 	// MaxRetries 设 -1 表示不重试：go-redis 把 0 当成「用默认的 3 次」。
 	// 连接池的 dial 重试已经在上面收成一次，这里再关掉命令重试，
@@ -103,9 +114,9 @@ func pingRedis(m *Module, addr string) {
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer pingCancel()
 	if pingErr := client.Ping(pingCtx).Err(); pingErr != nil {
-		log.Printf("[WARN] Failed to ping Redis (%s): %v (server continues to run)", addr, pingErr)
+		slog.Warn("Failed to ping Redis (server continues to run)", slog.String("source", name), slog.String("addr", addr), slog.Any("error", pingErr))
 	} else {
-		log.Printf("[INFO] Redis connection ping successful")
+		slog.Info("Redis connection ping successful", slog.String("source", name))
 	}
 }
 

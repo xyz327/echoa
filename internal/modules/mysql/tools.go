@@ -285,6 +285,7 @@ func (m *Module) HandleQuery(ctx context.Context, claims *casdoorsdk.Claims, arg
 	}
 
 	var results []map[string]any
+	totalBytes := 0
 	truncated := false
 	for rows.Next() {
 		values := make([]any, len(columns))
@@ -297,21 +298,29 @@ func (m *Module) HandleQuery(ctx context.Context, claims *casdoorsdk.Claims, arg
 			return "", err
 		}
 
+		rowBytes := 0
 		rowMap := make(map[string]any, len(columns))
 		for i, col := range columns {
 			val := values[i]
 			if b, ok := val.([]byte); ok {
-				rowMap[col] = truncateCell(string(b))
+				s := truncateCell(string(b))
+				rowMap[col] = s
+				rowBytes += len(col) + len(s)
 			} else if s, ok := val.(string); ok {
-				rowMap[col] = truncateCell(s)
+				s = truncateCell(s)
+				rowMap[col] = s
+				rowBytes += len(col) + len(s)
 			} else {
 				rowMap[col] = val
+				rowBytes += len(col)
 			}
 		}
+		totalBytes += rowBytes
 		results = append(results, rowMap)
 
 		// 行数上限之外再守一道累计字节上限：宽行或大字段会在行数耗尽前就撑满上下文。
-		if estimateRowsBytes(results) > maxResultBytes {
+		// 增量累计计算避免每行重复全量扫描结果集 (从 O(N^2) 降至 O(N))
+		if totalBytes > maxResultBytes {
 			truncated = true
 			break
 		}

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v4"
+	"golang.org/x/sync/singleflight"
 )
 
 // JWK 表示符合 RFC 7517 标准的单条 JSON Web Key
@@ -45,6 +46,7 @@ type JWKSManager struct {
 	httpClient  *http.Client
 	ttl         time.Duration
 	minInterval time.Duration
+	sf          singleflight.Group
 	mu          sync.RWMutex
 	keys        map[string]crypto.PublicKey
 	rawKeys     []crypto.PublicKey
@@ -102,34 +104,23 @@ func (m *JWKSManager) GetKey(ctx context.Context, kid string) (crypto.PublicKey,
 	}
 	m.mu.RUnlock()
 
-	// 2. 慢路径：写锁刷新缓存
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// 双重检查
-	if !m.lastFetched.IsZero() && time.Since(m.lastFetched) < m.ttl {
-		if kid != "" {
-			if key, ok := m.keys[kid]; ok {
-				return key, nil
-			}
-		} else if len(m.rawKeys) == 1 {
-			return m.rawKeys[0], nil
+	// 2. 慢路径：通过 singleflight 避免并发风暴/击穿，网络 I/O 期间不持有全局锁
+	_, sfErr, _ := m.sf.Do("fetch_jwks", func() (any, error) {
+		// 进入 singleflight 后先二次检查缓存 (避免上一个请求刚刷新完)
+		m.mu.RLock()
+		if !m.lastFetched.IsZero() && time.Since(m.lastFetched) < m.minInterval {
+			m.mu.RUnlock()
+			return nil, nil
 		}
-	}
+		m.mu.RUnlock()
 
-	// 限制最小刷新间隔，避免恶意无效 kid 频繁打垮认证服务器
-	if !m.lastFetched.IsZero() && time.Since(m.lastFetched) < m.minInterval {
-		if kid != "" {
-			if key, ok := m.keys[kid]; ok {
-				return key, nil
-			}
-		} else if len(m.rawKeys) > 0 {
-			return m.rawKeys[0], nil
-		}
-		return nil, fmt.Errorf("public key with kid %q not found in JWKS (rate limited)", kid)
-	}
+		return nil, m.fetch(ctx)
+	})
 
-	if err := m.fetchLocked(ctx); err != nil {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if sfErr != nil {
 		// 网络故障时，若本地已有旧缓存则尽量宽容服务
 		if kid != "" {
 			if key, ok := m.keys[kid]; ok {
@@ -138,7 +129,7 @@ func (m *JWKSManager) GetKey(ctx context.Context, kid string) (crypto.PublicKey,
 		} else if len(m.rawKeys) > 0 {
 			return m.rawKeys[0], nil
 		}
-		return nil, fmt.Errorf("failed to fetch JWKS from %s: %w", m.jwksURI, err)
+		return nil, fmt.Errorf("failed to fetch JWKS from %s: %w", m.jwksURI, sfErr)
 	}
 
 	if kid != "" {
@@ -167,7 +158,7 @@ func (m *JWKSManager) Keyfunc() jwt.Keyfunc {
 	}
 }
 
-func (m *JWKSManager) fetchLocked(ctx context.Context) error {
+func (m *JWKSManager) fetch(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.jwksURI, nil)
 	if err != nil {
 		return err
@@ -207,9 +198,11 @@ func (m *JWKSManager) fetchLocked(ctx context.Context) error {
 		return errors.New("no valid public keys parsed from JWKS response")
 	}
 
+	m.mu.Lock()
 	m.keys = newKeys
 	m.rawKeys = newRawKeys
 	m.lastFetched = time.Now()
+	m.mu.Unlock()
 	return nil
 }
 

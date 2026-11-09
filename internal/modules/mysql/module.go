@@ -4,13 +4,20 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	"echoa/internal/config"
+	"echoa/internal/datasource"
 	"echoa/internal/mcp"
 	_ "github.com/go-sql-driver/mysql"
 )
+
+func init() {
+	datasource.Register(config.SourceKindMySQL, func(ref config.SourceRef) (datasource.Instance, error) {
+		return Open(ref.Name, ref.MySQL)
+	})
+}
 
 type Module struct {
 	cfg config.MySQLConfig
@@ -31,24 +38,13 @@ func (m *Module) Ping(ctx context.Context) error {
 	return m.db.PingContext(ctx)
 }
 
-// Register 把一份 MySQL 配置注册成一组只读工具。
-// name 是 source 名字：一个 endpoint 只挂这一个 MySQL 时工具名保持 mysql_query；
-// 同一个 endpoint 挂多个 MySQL 时，工具名带上名字（orders_mysql_query），避免互相覆盖。
-func Register(registry *mcp.ToolRegistry, name string, cfg config.MySQLConfig, qualify bool) (*Module, error) {
-	return registerModule(registry, name, cfg, qualify, nil)
+// RegisterTools 满足 datasource.Instance 接口，向 ToolRegistry 注册 MySQL 对应工具
+func (m *Module) RegisterTools(registry *mcp.ToolRegistry, sourceName string, qualify bool) {
+	registerTools(registry, sourceName, m, qualify)
 }
 
-// RegisterExisting 把已经建好连接池的模块再注册到另一个 endpoint 的工具表，不再新开连接。
-func RegisterExisting(registry *mcp.ToolRegistry, name string, m *Module, qualify bool) {
-	_, _ = registerModule(registry, name, m.cfg, qualify, m)
-}
-
-func registerModule(registry *mcp.ToolRegistry, name string, cfg config.MySQLConfig, qualify bool, existing *Module) (*Module, error) {
-	if existing != nil {
-		registerTools(registry, name, existing, qualify)
-		return existing, nil
-	}
-
+// Open 初始化 MySQL 连接池并执行启动探活
+func Open(name string, cfg config.MySQLConfig) (*Module, error) {
 	db, err := sql.Open("mysql", cfg.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open mysql connection: %w", err)
@@ -65,17 +61,30 @@ func registerModule(registry *mcp.ToolRegistry, name string, cfg config.MySQLCon
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer pingCancel()
 	if err := db.PingContext(pingCtx); err != nil {
-		log.Printf("[WARN] Failed to ping MySQL (%s): %v (server continues to run)", cfg.DSN, err)
+		slog.Warn("Failed to ping MySQL (server continues to run)", slog.String("source", name), slog.String("dsn", cfg.DSN), slog.Any("error", err))
 	} else {
-		log.Printf("[INFO] MySQL connection ping successful")
+		slog.Info("MySQL connection ping successful", slog.String("source", name))
 	}
 
-	m := &Module{
+	return &Module{
 		cfg: cfg,
 		db:  db,
+	}, nil
+}
+
+// Register 把一份 MySQL 配置注册成一组只读工具。
+func Register(registry *mcp.ToolRegistry, name string, cfg config.MySQLConfig, qualify bool) (*Module, error) {
+	m, err := Open(name, cfg)
+	if err != nil {
+		return nil, err
 	}
-	registerTools(registry, name, m, qualify)
+	m.RegisterTools(registry, name, qualify)
 	return m, nil
+}
+
+// RegisterExisting 把已经建好连接池的模块再注册到另一个 endpoint 的工具表，不再新开连接。
+func RegisterExisting(registry *mcp.ToolRegistry, name string, m *Module, qualify bool) {
+	m.RegisterTools(registry, name, qualify)
 }
 
 func registerTools(registry *mcp.ToolRegistry, name string, m *Module, qualify bool) {

@@ -43,24 +43,28 @@
    - 兼容老旧客户端通过 URL Query（`?token=...` / `?access_token=...`）传参的模式（已标记为 Deprecated 并记录安全告警）。
    - 实现 RFC 9728 规范的 Protected Resource Metadata (`/.well-known/oauth-protected-resource`)，支持客户端自动发现认证服务器与 Scope。
 3. **MySQL 深度 AST 防御体系与可选 Schema**：
-   - 基于 `pingcap/tidb/pkg/parser` 对传入 SQL 做抽象语法树（AST）强校验，仅允许 `SELECT`、`EXPLAIN`、`SHOW`。
+   - 基于 `pingcap/tidb/pkg/parser` 对传入 SQL 做抽象语法树（AST）强校验，仅允许 `SELECT`、`EXPLAIN`、`SHOW`；使用 `sync.Pool` 复用 AST 解析器实例降低 GC 与初始化损耗。
    - 彻底拦截 `SELECT ... FOR UPDATE`、`LOCK IN SHARE MODE` 等加锁读取，以及 `SELECT ... INTO OUTFILE / DUMPFILE` 等服务端写盘提权语句。
+   - 严密拦截高危/DoS 内置函数：`SLEEP`（拒绝服务与时间盲注）、`BENCHMARK`（CPU 空转耗尽）、`LOAD_FILE`（主机磁盘文件探测与泄露）、`GET_LOCK` / `RELEASE_LOCK`（会话阻塞与互斥锁攻击）、`SYS_EVAL` 等 UDF 函数。
    - 智能 LIMIT 注入与改写：无 LIMIT 自动追加系统上限；超过配置上限强制压低改写；保留原分页 offset 并受 `max_offset` 上限约束；子查询与外层查询严格隔离改写；`EXPLAIN ANALYZE`（会真正执行内层语句）与普通 SELECT 同等注入 LIMIT，避免绕过行数上限。
    - 跨库支持与可选 Schema：DSN 允许省略默认数据库（非强制绑定），提供 `mysql_list_databases` 数据库发现；`mysql_list_tables` / `mysql_describe_table` 支持参数指定 schema 或 `schema.table` 格式；`mysql_query` 在 AST 层自动补全 schema 限定，**杜绝并发调用 `USE db` 导致连接池污染**。
    - 敏感数据表黑名单过滤（支持 `table` 与 `schema.table` 精准匹配拦截）。
-   - 双重防撑爆防护：单单元格 4KB 缩略截断 + 结果集 64KB 字符级硬上限。
+   - 双重防撑爆防护：单单元格 4KB 缩略截断 + 增量累计计算字节数（$O(1)$ 单行步进），严格守住结果集 64KB 字符级硬上限。
 4. **Redis 6 ACL 鉴权与多 DB 独立隔离治理**：
    - 支持 Redis 6+ ACL 用户名（`username`）与密码认证，原生适配腾讯云等只读 ACL 账号（如 `mcp_ro`）。
    - 动态客户端管理器（`MultiDBManager`），每个逻辑 DB 独立连接池懒加载并继承 ACL 凭证，**杜绝并发执行 `SELECT` 导致的数据串库重大隐患**。
    - 完备连接池生命周期参数（`pool_size`、`min_idle_conns`、10m 空闲超时、1h 存活淘汰），防御云原生网络下的静默断连。
    - 统一命令网关 `redis_execute`，内置命令白名单与硬黑名单防御（阻断 `KEYS`、`FLUSHALL`、`CONFIG`、写操作及手动切库 `SELECT`）。
    - 多类型（`[]string`、`map[string]string`、RESP3 `map[any]any`）双重截断保护（条目上限 + 64KB 响应硬上限）。
-5. **按 endpoint 隔离的数据源**：
+5. **插件化数据源驱动工厂（DataSource Factory）与按 endpoint 隔离**：
+   - 采用标准 `datasource.Instance` 接口与工厂注册机制（`datasource.Register`），解耦具体数据源实现与核心调度路由，新数据源类型插件化热插拔。
    - `sources` 按名字声明任意数量的 MySQL 与 Redis 连接，`endpoints` 决定每个连接暴露在哪个路径。
    - 每个 endpoint 是一套独立的无状态 MCP 服务和工具表：`POST /mysql1` 只看得到它引用的 source 的工具，互不干扰。
    - 一个 endpoint 只挂一个 MySQL 时工具名保持 `mysql_query`；同一个 endpoint 挂多个同种类 source 时，工具名带上 source 名字（`orders_mysql_query`），避免互相覆盖。
-6. **无状态传输韧性与可观测性**：
+6. **无状态传输韧性与全链路可观测性**：
    - 遵循 MCP 2026-07-28 无状态 Streamable HTTP 规范：无握手、无 Session 状态依赖，通过 `server/discover` 进行能力与版本发现，每个请求通过 HTTP 标头及 `_meta` 携带协议版本与方法校验。
+   - 全链路统一结构化日志：接入标准库 `log/slog`，支持 `X-Request-ID` 上下文链路透传，审计日志（`audit`）与服务运行日志结构化输出。
+   - JWKS 内存防击穿：集成 `singleflight` 机制合并并发轮转刷新请求，杜绝冷启动与过期时的认证服务器风暴。
    - 单主体并发限制（默认最多 5 并发）与 HTTP 429 背压，按 endpoint + 鉴权主体（JWT subject / developer）隔离治理。
    - DNS Rebinding 保护（Origin 头严格校验）。
    - 结构化 JSON 审计日志（自动对 `password`、`token`、`secret` 等敏感参数脱敏，单参数超 200 字符缩略）。

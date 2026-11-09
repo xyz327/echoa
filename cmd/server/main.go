@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,32 +14,13 @@ import (
 
 	"echoa/internal/auth"
 	"echoa/internal/config"
+	"echoa/internal/datasource"
+	"echoa/internal/logger"
 	"echoa/internal/mcp"
-	"echoa/internal/modules/mysql"
-	"echoa/internal/modules/redis"
+	_ "echoa/internal/modules/mysql"
+	_ "echoa/internal/modules/redis"
 	"github.com/casdoor/casdoor-go-sdk/casdoorsdk"
 )
-
-// pinger 是健康检查探活的最小接口，MySQL 与 Redis 模块都实现了它。
-type pinger interface {
-	Ping(ctx context.Context) error
-	Close() error
-}
-
-// runningSource 按种类留着具体模块，复用连接池时不需要从接口再断言回去。
-type runningSource struct {
-	name  string
-	kind  string
-	mysql *mysql.Module
-	redis *redis.Module
-}
-
-func (s *runningSource) conn() pinger {
-	if s.mysql != nil {
-		return s.mysql
-	}
-	return s.redis
-}
 
 type runningEndpoint struct {
 	server *mcp.Server
@@ -48,18 +29,27 @@ type runningEndpoint struct {
 
 func main() {
 	configPath := flag.String("config", "config/config.yaml", "path to config file")
+	logFormat := flag.String("log-format", "json", "log format: json or text")
+	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, error")
 	flag.Parse()
 
-	// 1. 加载配置
+	// 1. 初始化统一结构化日志
+	logger.Init(*logLevel, *logFormat)
+
+	// 2. 加载配置
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		log.Fatalf("[FATAL] Failed to load config from '%s': %v", *configPath, err)
+		slog.Error("Failed to load config", slog.String("path", *configPath), slog.Any("error", err))
+		os.Exit(1)
 	}
 
-	log.Printf("[INFO] Config loaded successfully (Auth enabled: %v, ResourceURL: %s, endpoints: %d)",
-		cfg.Auth.Enabled, cfg.Auth.ResourceURL, len(cfg.Endpoints))
+	slog.Info("Config loaded successfully",
+		slog.Bool("auth_enabled", cfg.Auth.Enabled),
+		slog.String("resource_url", cfg.Auth.ResourceURL),
+		slog.Int("endpoints_count", len(cfg.Endpoints)),
+	)
 
-	// 2. 初始化 Casdoor SDK Client
+	// 3. 初始化 Casdoor SDK Client
 	var casdoorClient *casdoorsdk.Client
 	if cfg.Auth.Enabled {
 		casdoorClient = casdoorsdk.NewClient(
@@ -70,18 +60,18 @@ func main() {
 			cfg.Auth.OrganizationName,
 			cfg.Auth.ApplicationName,
 		)
-		log.Printf("[INFO] Casdoor client initialized for endpoint: %s", cfg.Auth.Endpoint)
+		slog.Info("Casdoor client initialized", slog.String("endpoint", cfg.Auth.Endpoint))
 	}
 
-	// 3. 每个 endpoint 一个 MCP Server 和独立的工具表。
-	//    同一个 source 被多个 endpoint 引用时只开一个连接池，工具注册进各自的 registry。
-	sources := map[string]*runningSource{}
+	// 4. 每个 endpoint 一个 MCP Server 和独立的工具表。
+	//    同一个 source 被多个 endpoint 引用时复用同一个 Instance，工具注册进各自的 registry。
+	sources := map[string]datasource.Instance{}
 	var endpoints []runningEndpoint
 
 	closeSources := func() {
-		for _, src := range sources {
-			if conn := src.conn(); conn != nil {
-				_ = conn.Close()
+		for _, inst := range sources {
+			if inst != nil {
+				_ = inst.Close()
 			}
 		}
 	}
@@ -99,69 +89,48 @@ func main() {
 			qualify := kindCount[ref.Kind] > 1
 
 			if existing, ok := sources[name]; ok {
-				switch ref.Kind {
-				case config.SourceKindMySQL:
-					mysql.RegisterExisting(registry, name, existing.mysql, qualify)
-				case config.SourceKindRedis:
-					redis.RegisterExisting(registry, name, existing.redis, qualify)
-				}
-				log.Printf("[INFO] Endpoint %s reuses source %q (%s)", ep.Path, name, ref.Kind)
+				existing.RegisterTools(registry, name, qualify)
+				slog.Info("Endpoint reuses source", slog.String("endpoint", ep.Path), slog.String("source", name), slog.String("kind", ref.Kind))
 				continue
 			}
 
-			running := &runningSource{name: name, kind: ref.Kind}
-			switch ref.Kind {
-			case config.SourceKindMySQL:
-				m, regErr := mysql.Register(registry, name, ref.MySQL, qualify)
-				if regErr != nil {
-					closeSources()
-					log.Fatalf("[FATAL] Failed to register MySQL source %q: %v", name, regErr)
-				}
-				running.mysql = m
-				log.Printf("[INFO] MySQL source %q registered on %s (max_limit: %d, qualified: %v)",
-					name, ep.Path, ref.MySQL.Security.MaxLimit, qualify)
-			case config.SourceKindRedis:
-				m, regErr := redis.Register(registry, name, ref.Redis, qualify)
-				if regErr != nil {
-					closeSources()
-					log.Fatalf("[FATAL] Failed to register Redis source %q: %v", name, regErr)
-				}
-				running.redis = m
-				log.Printf("[INFO] Redis source %q registered on %s (allowed_dbs: %v, qualified: %v)",
-					name, ep.Path, ref.Redis.AllowedDBs, qualify)
-			default:
+			inst, regErr := datasource.Create(ref)
+			if regErr != nil {
 				closeSources()
-				log.Fatalf("[FATAL] Endpoint %s references source %q of unknown kind %q", ep.Path, name, ref.Kind)
+				slog.Error("Failed to create datasource", slog.String("source", name), slog.String("kind", ref.Kind), slog.Any("error", regErr))
+				os.Exit(1)
 			}
-			sources[name] = running
+
+			inst.RegisterTools(registry, name, qualify)
+			sources[name] = inst
+			slog.Info("Source registered", slog.String("endpoint", ep.Path), slog.String("source", name), slog.String("kind", ref.Kind), slog.Bool("qualified", qualify))
 		}
 
 		for _, tool := range registry.ListTools() {
-			log.Printf("  -> [MCP TOOL %s] %s: %s", ep.Path, tool.Name, tool.Description)
+			slog.Debug("MCP tool registered", slog.String("endpoint", ep.Path), slog.String("tool", tool.Name))
 		}
 
 		srv := mcp.NewServer(ep.Path, registry, cfg.Server.MaxInflightPerPrincipal, cfg.Server.AllowedOrigins)
 		endpoints = append(endpoints, runningEndpoint{server: srv, path: ep.Path})
 	}
 
-	// 4. 组装路由
+	// 5. 组装路由
 	mux := http.NewServeMux()
 
-	// 5. 健康检查接口 (支持 Liveness 与 Readiness 探活)
+	// 6. 健康检查接口 (支持 Liveness 与 Readiness 探活)
 	checkReadiness := func(w http.ResponseWriter, r *http.Request) {
 		status := map[string]any{}
 		allHealthy := true
 
-		for _, src := range sources {
-			key := src.kind + ":" + src.name
+		for name, inst := range sources {
 			pingCtx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
-			err := src.conn().Ping(pingCtx)
+			err := inst.Ping(pingCtx)
 			cancel()
 			if err != nil {
-				status[key] = "error: " + err.Error()
+				status[name] = "error: " + err.Error()
 				allHealthy = false
 			} else {
-				status[key] = "ok"
+				status[name] = "ok"
 			}
 		}
 
@@ -189,13 +158,13 @@ func main() {
 
 	mux.HandleFunc("GET /health/ready", checkReadiness)
 
-	// RFC 9728 保护资源元数据接口（MCP OAuth 规范，供 Cursor / Claude 等客户端自动发现 Casdoor）
+	// RFC 9728 保护资源元数据接口
 	mux.HandleFunc("GET /.well-known/oauth-protected-resource", auth.ProtectedResourceMetadataHandler(cfg.Auth))
 
 	// Casdoor 鉴权中间件
 	authMw := auth.CasdoorMiddleware(cfg.Auth, casdoorClient)
 
-	// 每个 endpoint 挂独立的 MCP 2026-07-28 POST 路由
+	// 每个 endpoint 挂独立的 MCP POST 路由
 	for _, ep := range endpoints {
 		mux.Handle(ep.path, authMw(ep.server))
 	}
@@ -205,41 +174,41 @@ func main() {
 		Addr:        fmt.Sprintf(":%d", cfg.Server.Port),
 		Handler:     mux,
 		ReadTimeout: readTimeout,
-		// WriteTimeout 不设置：单次响应虽不是长连接，但耗时查询（如复杂 AST 校验及大型查询）由各自的 query_timeout_ms 控制。
 		IdleTimeout: 60 * time.Second,
 	}
 
-	// 6. 优雅停机：收到信号后停止接收新请求，再释放连接池
+	// 7. 优雅停机
 	go func() {
 		stop := make(chan os.Signal, 1)
 		signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 		<-stop
 
-		log.Println("[INFO] Graceful shutdown triggered, releasing resources...")
+		slog.Info("Graceful shutdown triggered, releasing resources...")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			log.Printf("[WARN] HTTP server shutdown: %v", err)
+			slog.Warn("HTTP server shutdown warning", slog.Any("error", err))
 		}
 	}()
 
-	log.Printf("[INFO] Server listening on http://0.0.0.0:%d", cfg.Server.Port)
-	log.Printf("[INFO] MCP PRM endpoint: GET http://0.0.0.0:%d/.well-known/oauth-protected-resource", cfg.Server.Port)
+	slog.Info("Server listening", slog.String("addr", fmt.Sprintf("http://0.0.0.0:%d", cfg.Server.Port)))
+	slog.Info("MCP PRM endpoint", slog.String("url", fmt.Sprintf("http://0.0.0.0:%d/.well-known/oauth-protected-resource", cfg.Server.Port)))
 	for _, ep := range endpoints {
-		log.Printf("[INFO] MCP endpoint %s: POST %s", ep.path, ep.path)
+		slog.Info("MCP endpoint registered", slog.String("path", ep.path))
 	}
 
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("[FATAL] HTTP server exited: %v", err)
+		slog.Error("HTTP server exited with error", slog.Any("error", err))
+		os.Exit(1)
 	}
 
 	for _, ep := range endpoints {
 		ep.server.Close()
 	}
-	for _, src := range sources {
-		if conn := src.conn(); conn != nil {
-			_ = conn.Close()
-			log.Printf("[INFO] %s source %q connection pool closed", src.kind, src.name)
+	for name, inst := range sources {
+		if inst != nil {
+			_ = inst.Close()
+			slog.Info("Datasource closed", slog.String("source", name))
 		}
 	}
 }
