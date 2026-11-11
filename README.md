@@ -74,13 +74,19 @@ server:
   max_inflight_per_principal: 5 # 每个 endpoint 单主体并发上限 (超限返回 429)
 
 auth:
-  enabled: false                # 本地调试置为 false；生产环境建议开启
-  resource_url: "${MCP_RESOURCE_URL:-http://127.0.0.1:8080}"
-  endpoint: "https://casdoor.example.com"
-  client_id: "mcp-service"
-  client_secret: "${CASDOOR_CLIENT_SECRET}"
-  certificate: "${CASDOOR_JWT_CERT}"
-  audience: "${CASDOOR_AUDIENCE:-}"
+  enabled: false                # 本地开发测试置为 false (匿名调试)，生产环境必须设为 true
+  resource_url: "${MCP_RESOURCE_URL:-http://127.0.0.1:8080}" # 服务对外公开 URL
+  endpoint: "https://casdoor.example.com"                   # Casdoor 实例根地址
+  client_id: "mcp-service"                                  # Casdoor 客户端 ID
+  client_secret: "${CASDOOR_CLIENT_SECRET}"                 # 客户端密钥
+  certificate: "${CASDOOR_JWT_CERT}"                       # Casdoor 应用的 x509 JWT 公钥证书内容 (兜底)
+  audience: "${CASDOOR_AUDIENCE:-}"                        # 预期 JWT aud（建议设为 resource_url）；另兼容 resource_url 与 resource_url/<path>
+  jwks_uri: "${CASDOOR_JWKS_URI:-}"                        # Casdoor JWKS 端点 (留空推导为 <endpoint>/.well-known/jwks)
+  organization_name: "your-org"                             # 组织名称
+  application_name: "mcp-app"                               # 应用名称
+  scopes_required:                                          # 要求的权限范围
+    - "openid"
+    - "offline_access"
 
 sources:
   mysql:

@@ -162,16 +162,90 @@ func parseAndValidateToken(ctx context.Context, tokenStr string, cfg config.Auth
 		return nil, errors.New("refresh token cannot be used as access token")
 	}
 
-	// 4. 强制校验 Audience (aud)，杜绝 Casdoor 同一实例下不同 Client ID 跨应用伪造
-	expectedAud := strings.TrimSpace(cfg.Audience)
-	if expectedAud == "" {
-		expectedAud = strings.TrimSpace(cfg.ClientID)
-	}
-	if expectedAud != "" && !claims.VerifyAudience(expectedAud, true) {
-		return nil, fmt.Errorf("invalid audience, expected %q", expectedAud)
+	// 4. 强制校验 Audience (aud)：接受配置 audience / client_id，以及
+	// RFC 8707 resource（resource_url）与部分客户端用的 resource_url+/path（如 /all、/mysql）
+	if !audienceAccepted(claims, cfg) {
+		return nil, fmt.Errorf("invalid audience, accepted %v", acceptedAudiencesHint(cfg))
 	}
 
 	return claims, nil
+}
+
+// expectedAudience 返回配置的主 audience；未配 audience 时回退到 client_id。
+func expectedAudience(cfg config.AuthConfig) string {
+	if aud := strings.TrimSpace(cfg.Audience); aud != "" {
+		return aud
+	}
+	return strings.TrimSpace(cfg.ClientID)
+}
+
+// normalizeResourceURL 去掉尾部 /，供 aud 比较。
+func normalizeResourceURL(resourceURL string) string {
+	return strings.TrimRight(strings.TrimSpace(resourceURL), "/")
+}
+
+// audienceMatchesResource 判断 aud 是否等于 resource，或 resource 下单一 path 段
+//（兼容 Cursor 把连接 URL 如 https://host/all 当作 resource 写入 aud）。
+func audienceMatchesResource(aud, resource string) bool {
+	aud = strings.TrimRight(strings.TrimSpace(aud), "/")
+	resource = normalizeResourceURL(resource)
+	if aud == "" || resource == "" {
+		return false
+	}
+	if aud == resource {
+		return true
+	}
+	prefix := resource + "/"
+	if !strings.HasPrefix(aud, prefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(aud, prefix)
+	return rest != "" && !strings.Contains(rest, "/") && !strings.ContainsAny(rest, "?#")
+}
+
+// audienceAccepted 校验 JWT aud 是否命中允许集合。
+func audienceAccepted(claims *casdoorsdk.Claims, cfg config.AuthConfig) bool {
+	expected := expectedAudience(cfg)
+	resource := normalizeResourceURL(cfg.ResourceURL)
+
+	// 未配置 audience / client_id / resource 时不做 aud 强制校验
+	if expected == "" && resource == "" {
+		return true
+	}
+	if expected != "" && claims.VerifyAudience(expected, true) {
+		return true
+	}
+	if resource != "" {
+		for _, aud := range claims.Audience {
+			if audienceMatchesResource(aud, resource) {
+				return true
+			}
+		}
+		// expected 本身就是 resource 时，VerifyAudience 已覆盖精确匹配；
+		// 再允许 expected 作为 resource 基址的 /path 变体（audience 配成 resource_url 的常见情况）
+		if expected != "" && expected != resource {
+			for _, aud := range claims.Audience {
+				if audienceMatchesResource(aud, expected) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func acceptedAudiencesHint(cfg config.AuthConfig) []string {
+	hint := make([]string, 0, 3)
+	if expected := expectedAudience(cfg); expected != "" {
+		hint = append(hint, expected)
+	}
+	if resource := normalizeResourceURL(cfg.ResourceURL); resource != "" {
+		if len(hint) == 0 || hint[0] != resource {
+			hint = append(hint, resource)
+		}
+		hint = append(hint, resource+"/<path>")
+	}
+	return hint
 }
 
 // clientIP 取代理链中最左侧的客户端地址，没有代理头时退回 RemoteAddr。

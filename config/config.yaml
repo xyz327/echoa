@@ -12,7 +12,7 @@ auth:
   client_id: "mcp-service"
   client_secret: "${CASDOOR_CLIENT_SECRET}"
   certificate: "${CASDOOR_JWT_CERT}"
-  audience: "${CASDOOR_AUDIENCE:-}"                        # 预期 JWT Audience (aud)，默认取 client_id
+  audience: "${CASDOOR_AUDIENCE:-}"                        # 预期 JWT aud（建议设为 resource_url）；另兼容 resource_url 与 resource_url/<path>
   jwks_uri: "${CASDOOR_JWKS_URI:-}"                        # Casdoor JWKS 端点地址 (如 https://casdoor.example.com/.well-known/jwks)
   organization_name: "your-org"
   application_name: "mcp-app"
